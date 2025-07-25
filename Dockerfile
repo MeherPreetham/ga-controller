@@ -6,7 +6,7 @@ WORKDIR /app
 
 # 3) Copy & install Python dependencies
 COPY requirements.txt .
-RUN pip install -y requirements.txt
+RUN pip install -r requirements.txt
 
 # 4) Copy service code
 COPY app.py .
