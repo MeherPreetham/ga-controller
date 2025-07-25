@@ -17,4 +17,4 @@ COPY app.py .
 EXPOSE 80 8000
 
 # 6) Run the FastAPI application
-CMD ["uvicorn", "app:app.py", "--host", "0.0.0.0", "--port", "80"]
+CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "80"]
