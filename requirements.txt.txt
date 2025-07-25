@@ -1,0 +1,8 @@
+fastapi
+uvicorn[standard]
+httpx
+redis
+prometheus-client
+azure-storage-blob
+pydantic
+logging
