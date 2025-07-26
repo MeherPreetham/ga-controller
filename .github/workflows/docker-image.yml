@@ -30,13 +30,13 @@ jobs:
           file: ./Dockerfile
           push: true
           tags: |
-            ${{ secrets.DOCKERHUB_USERNAME }}/ga-microservice:latest
-            ${{ secrets.DOCKERHUB_USERNAME }}/ga-microservice:${{ github.sha }}
+            ${{ secrets.DOCKERHUB_USERNAME }}/ga-controller:latest
+            ${{ secrets.DOCKERHUB_USERNAME }}/ga-controller:${{ github.sha }}
 
       - name: show pushed image digest
         run: |
           DIGEST=$(docker buildx imagetools inspect \
-            ${{ secrets.DOCKERHUB_USERNAME }}/ga-microservice:latest --raw \
+            ${{ secrets.DOCKERHUB_USERNAME }}/ga-controller:latest --raw \
             | jq -r .manifests[0].digest)
           echo "Image pushed with digest: $DIGEST"
       
