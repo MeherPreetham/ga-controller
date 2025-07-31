@@ -5,7 +5,7 @@ import uuid
 import time
 import random
 import json
-import logging 
+import logging
 
 from typing import List, Optional, Dict
 from fastapi import FastAPI, BackgroundTasks
@@ -15,80 +15,70 @@ import redis
 from prometheus_client import Counter, Gauge, start_http_server
 from azure.storage.blob import BlobServiceClient
 
-##########Logging Configuration###############################
+########## LOGGING CONFIGURATION ###############################
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
 )
 logger = logging.getLogger("ga-controller")
 
-#########GA PARAMETER DEFAULTS FROM ENV##########################
-NUM_TASKS_DEFAULT      = int(os.getenv("NUM_TASKS",      "1000"))
-NUM_CORES_DEFAULT      = int(os.getenv("NUM_CORES",      "16"))
-POPULATION_DEFAULT     = int(os.getenv("POPULATION",     "200"))
-GENERATIONS_DEFAULT    = int(os.getenv("GENERATIONS",    "500"))
-CROSSOVER_RATE_DEFAULT = float(os.getenv("CROSSOVER_RATE", "0.8"))
-MUTATION_RATE_DEFAULT  = float(os.getenv("MUTATION_RATE",  "0.2"))
-BASE_ENERGY_DEFAULT    = float(os.getenv("BASE_ENERGY",    "0.01"))
-IDLE_ENERGY_DEFAULT    = float(os.getenv("IDLE_ENERGY",    "0.002"))
-SEED_ENV               = os.getenv("SEED")  # optional string or None
-
-##############PROMETHEUS METRICS##################################
+############## PROMETHEUS METRICS ##################################
 gen_counter  = Counter('ga_generations_total', 'Total GA generations')
 best_fitness = Gauge('ga_best_fitness',    'Best fitness per generation')
 mean_fitness = Gauge('ga_mean_fitness',    'Mean fitness per generation')
 gen_duration = Gauge('ga_generation_seconds', 'Seconds per generation')
 
-################REDIS CLIENT######################################
+################ REDIS CLIENT ######################################
 rdb = redis.Redis(
     host=os.getenv("REDIS_HOST", "redis"),
     port=int(os.getenv("REDIS_PORT", 6379)),
     db=int(os.getenv("REDIS_DB", 0)),
+    password=os.getenv("REDIS_PASSWORD"),
     decode_responses=True
 )
-################AZURE BLOB STORAGE CLIENT########################
-blob_conn      = os.getenv("AZURE_STORAGE_CONNECTION_STRING", "")
-blob_container = os.getenv("BLOB_CONTAINER", "ga-results")
-blob_service   = BlobServiceClient.from_connection_string(blob_conn)
-# Ensure container exists
+################ AZURE BLOB STORAGE CLIENT ########################
+blob_service = BlobServiceClient.from_connection_string(
+    os.getenv("AZURE_STORAGE_CONNECTION_STRING")
+)
+blob_container = os.getenv("BLOB_CONTAINER")
 try:
     blob_service.create_container(blob_container)
 except Exception:
     pass
 
-################FASTAPI APP######################################
+################ EVALUATOR SERVICE CONFIG ########################
+EVALUATOR_HOST = os.getenv("EVALUATOR_HOST", "ga-evaluator")
+EVALUATOR_PORT = os.getenv("EVALUATOR_PORT", "5000")
+EVALUATOR_URL  = f"http://{EVALUATOR_HOST}:{EVALUATOR_PORT}/evaluate"
+
+
+################ FASTAPI APP ######################################
 app = FastAPI()
-# Expose Prom metrics on port 8000
 start_http_server(8000)
 
 class RunRequest(BaseModel):
-    num_tasks:      int    = NUM_TASKS_DEFAULT
-    num_cores:      int    = NUM_CORES_DEFAULT
-    population:     int    = POPULATION_DEFAULT
-    generations:    int    = GENERATIONS_DEFAULT
-    crossover_rate: float  = CROSSOVER_RATE_DEFAULT
-    mutation_rate:  float  = MUTATION_RATE_DEFAULT
-    base_energy:    float  = BASE_ENERGY_DEFAULT
-    idle_energy:    float  = IDLE_ENERGY_DEFAULT
-    seed: Optional[int] = Field(
-    default_factory=lambda: int(SEED_ENV) if SEED_ENV is not None else None
-)
+    num_tasks:        int   = Field(..., gt=0, description="Number of tasks")
+    num_cores:        int   = Field(..., gt=0, description="Number of cores")
+    population:       int   = Field(..., gt=0, description="GA population size")
+    generations:      int   = Field(..., gt=0, description="Number of generations")
+    crossover_rate:   float = Field(..., ge=0, le=1, description="Crossover probability")
+    mutation_rate:    float = Field(..., ge=0, le=1, description="Mutation probability")
+    base_energy:      float = Field(..., gt=0, description="Energy per active unit time")
+    idle_energy:      float = Field(..., gt=0, description="Energy per idle unit time")
+    seed:             Optional[int] = Field(None, description="Optional RNG seed")
 
+class RunResponse(BaseModel):
+    job_id: str
 
-@app.post("/run")
-async def start_run(req: RunRequest, bg: BackgroundTasks):
+########### API ENDPOINTS ################################################
+@app.post("/run", response_model=RunResponse)
+def start_run(req: RunRequest, bg: BackgroundTasks):
+    params = req.dict()
     job_id = str(uuid.uuid4())
-    logger.info(f"Received /run request: job_id={job_id}, params={req.dict()}")
-    key = f"job:{job_id}"
-    rdb.hset(key, mapping={
-        "status":     "running",
-        "generation": "0",
-        "best":       ""
-    })
-    rdb.expire(key, 24*3600)
-
-    bg.add_task(run_ga, job_id, req.dict())
-    return {"job_id": job_id}
+    redis_key = f"job:{job_id}"
+    rdb.hset(redis_key, mapping={"status": "running", "generation": "0", "best": ""})
+    bg.add_task(run_ga, job_id, params)
+    return RunResponse(job_id=job_id)
 
 @app.get("/run/{job_id}/status")
 def status(job_id: str):
@@ -194,7 +184,7 @@ async def run_ga(job_id: str, cfg: Dict):
         # Parallel fitness eval via evaluator service
         async with httpx.AsyncClient() as client:
             calls = [
-                client.post("http://evaluator:5000/evaluate", json={
+                client.post(f"{EVALUATOR_URL}", json={
                     "individual":      indiv,
                     "execution_times": exec_times,
                     "base_energy":     cfg["base_energy"],
