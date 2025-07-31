@@ -173,7 +173,7 @@ async def run_ga(job_id: str, cfg: Dict):
     pop_seed  = base_seed + island_id
     rng_pop = random.Random(pop_seed)
     population = init_population(cfg["population"], cfg["num_tasks"], cfg["num_cores"], rng=rng_pop)
-    logger.info(f"Job {job_id}: initialized population size={len(population)} on island={island_id}")
+    logger.debug(f"Job {job_id} Island {island_id}: starting population preview (first 10 individuals): {population[:10]}")
 
     prev_best      = float('inf')
     best_individual = None
