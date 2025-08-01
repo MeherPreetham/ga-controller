@@ -70,7 +70,7 @@ class RunRequest(BaseModel):
     generations:      int   = Field(..., gt=0, description="Number of generations")
     crossover_rate:   float = Field(..., ge=0, le=1, description="Crossover probability")
     mutation_rate:    float = Field(..., ge=0, le=1, description="Mutation probability")
-    migration_interval:   int = Field(..., ge=0, le=1, description="Number of generations between island migrations")
+    migration_interval:   int = Field(..., gt=0, description="Number of generations between island migrations")
     num_islands:      int   = Field(..., gt=0, description="Number of islands for migration")
     base_energy:      float = Field(..., gt=0, description="Energy per active unit time")
     idle_energy:      float = Field(..., gt=0, description="Energy per idle unit time")
@@ -227,6 +227,13 @@ async def run_ga(job_id: str, cfg: Dict):
 
         logger.info(f"Job {job_id} Gen {gen}: best={best:.4f}, mean={mean_val:.4f}")
 
+        status_map = {
+            "generation": str(gen),
+            "best":       str(prev_best if prev_best < float('inf') else best),
+            "individual": json.dumps(best_individual) if best_individual else ""
+        }
+        rdb.hset(key, mapping=status_map)
+
         # Overwrite Redis only on improvement
         if best < prev_best:
             idx = fitnesses.index(best)
@@ -239,7 +246,7 @@ async def run_ga(job_id: str, cfg: Dict):
             rdb.lpush(MIGRATION_KEY, json.dumps(best_individual))
             prev_best = best
 
-         # Island migration every `interval` generations
+        # Island migration every `interval` generations
         if gen % interval == 0:
             migrants_raw = rdb.lrange(MIGRATION_KEY, 0, num_islands - 1)
             migrants = [json.loads(m) for m in migrants_raw]
