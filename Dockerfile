@@ -1,20 +1,23 @@
-# ga-controller/Dockerfile
-FROM python:3.10-slim
+# 1. Base image
+FROM python:3.11-slim
 
-# 2) Set working directory
+# 2. Set working dir
 WORKDIR /app
 
-# 3) Copy & install Python dependencies
+# 3. Copy & install dependencies (no pip cache)
 COPY requirements.txt .
-RUN pip install -r requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt
 
-# 4) Copy service code
+# 4. Copy the application code
 COPY app.py .
 
-# 5) Expose ports:
-#    - 80   → FastAPI HTTP API
-#    - 8000 → Prometheus metrics (start_http_server)
-EXPOSE 80 8000
+# 5. Create and switch to a non-root user
+RUN adduser --system --group appuser \
+ && chown -R appuser:appuser /app
+USER appuser
 
-# 6) Run the FastAPI application
-CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "80"]
+# 6. Expose FastAPI port
+EXPOSE 80
+
+# 7. Start Uvicorn with a single worker
+CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "80", "--workers", "1"]
