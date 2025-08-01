@@ -119,7 +119,7 @@ async def eval_with_retries(
 
 ########### API ENDPOINTS ######################################
 @app.post("/run", response_model=RunResponse)
-def start_run(req: RunRequest, bg: BackgroundTasks):
+async def start_run(req: RunRequest, bg: BackgroundTasks):
     job_id    = str(uuid.uuid4())
     redis_key = f"job:{job_id}"
     # initialize status in Redis
@@ -130,6 +130,23 @@ def start_run(req: RunRequest, bg: BackgroundTasks):
     })
     # launch GA in background
     bg.add_task(run_ga, job_id, req.dict())
+
+    async def fan_out():
+        async with httpx.AsyncClient() as client:
+            tasks = []
+            for i in range(req.num_islands):
+                host = (
+                  f"ga-controller-{i}"
+                  f".ga-controller-headless.default.svc.cluster.local:8000"
+                )
+                payload = {"job_id": job_id, **req.dict()}
+                tasks.append(
+                    client.post(f"http://{host}/execute", json=payload, timeout=10.0)
+                )
+            # run all calls in parallel
+            await asyncio.gather(*tasks, return_exceptions=True)
+    bg.add_task(fan_out)
+
     return RunResponse(job_id=job_id)
 
 @app.get("/run/{job_id}/status")
@@ -209,6 +226,27 @@ def compute_core_times(individual: List[int],
     for i, c in enumerate(individual):
         cores[c] += exec_times[i]
     return cores
+
+def compute_core_times(individual: List[int],
+                       exec_times:  List[float],
+                       num_cores:   int) -> List[float]:
+    cores = [0.0]*num_cores
+    for i, c in enumerate(individual):
+        cores[c] += exec_times[i]
+    return cores
+
+class ExecuteRequest(RunRequest):
+    job_id: str = Field(..., description="UUID of the job to execute.")
+
+@app.post("/execute")
+async def execute_island(req: ExecuteRequest):
+    """
+    Internal call: each replica receives the same job_id + GA params
+    and runs its island in-process.
+    """
+    # Kick off the GA loop on this pod (await so errors bubble)
+    await run_ga(req.job_id, req.dict(exclude={"job_id"}))
+    return {"status": "accepted", "pod": os.getenv("POD_NAME")}
 
 ########## MAIN GA LOOP #######################################
 async def run_ga(job_id: str, cfg: Dict):
