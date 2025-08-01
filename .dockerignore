@@ -1,0 +1,7 @@
+# ignore everything by default
+**
+
+# but allow these files into the Docker build context
+!Dockerfile
+!requirements.txt
+!app.py
