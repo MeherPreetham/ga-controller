@@ -16,8 +16,8 @@ RUN adduser --system --group appuser \
  && chown -R appuser:appuser /app
 USER appuser
 
-# 6. Expose FastAPI port
-EXPOSE 80
+# 6. Expose FastAPI port (non-privileged)
+EXPOSE 8000
 
-# 7. Start Uvicorn with a single worker
-CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "80", "--workers", "1"]
+# 7. Start Uvicorn  on port 8000 with a single worker
+CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1"]
