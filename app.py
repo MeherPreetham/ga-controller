@@ -12,7 +12,7 @@ from fastapi import FastAPI, BackgroundTasks
 from pydantic import BaseModel, Field
 import httpx
 import redis
-from prometheus_client import Counter, Gauge, start_http_server, Histogram
+from prometheus_client import Counter, Gauge, Histogram, generate_latest, CONTENT_TYPE_LATEST
 from azure.storage.blob import BlobServiceClient
 
 ########## LOGGING CONFIGURATION ###############################
