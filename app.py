@@ -243,54 +243,46 @@ async def execute_island(req: ExecuteRequest):
 
 ########## MAIN GA LOOP #######################################
 async def run_ga(job_id: str, cfg: Dict):
-    key           = f"job:{job_id}"
-    interval      = cfg["migration_interval"]
-    num_islands   = cfg["num_islands"]
+    key             = f"job:{job_id}"
+    interval        = cfg["migration_interval"]
+    num_islands     = cfg["num_islands"]
+    prev_best       = float('inf')
+    best_individual = None
+    no_improve_count= 0
+    stagnation_limit= cfg.get("stagnation_limit") or 0
 
-    # Generate execution times with a seed
+    # generate execution times
     base_seed  = cfg.get("seed") or 0
     rng_exec   = random.Random(base_seed)
     exec_times = [rng_exec.randint(1,10) for _ in range(cfg["num_tasks"])]
     logger.info(f"Job {job_id}: exec_times (first 5): {exec_times[:5]}")
 
-    # Island-specific seed
-    pod_name    = os.getenv("POD_NAME", "ga-island-0")
-    island_id   = int(pod_name.rsplit("-", 1)[-1])
-    rng_pop     = random.Random(base_seed + island_id)
+    # island-specific seed
+    pod_name  = os.getenv("POD_NAME", "ga-island-0")
+    island_id = int(pod_name.rsplit("-", 1)[-1])
+    rng_pop   = random.Random(base_seed + island_id)
 
-    population = init_population(
-        cfg["population"],
-        cfg["num_tasks"],
-        cfg["num_cores"],
-        rng_pop
-    )
+    population = init_population(cfg["population"], cfg["num_tasks"], cfg["num_cores"], rng_pop)
     ga_population_size.set(len(population))
-
-    prev_best        = float('inf')
-    best_individual  = None
-    no_improve_count = 0
-    stagnation_limit = cfg.get("stagnation_limit")
 
     for gen in range(1, cfg["generations"] + 1):
         start = time.time()
 
-        # Parallel eval with retries
+        # parallel eval
         async with httpx.AsyncClient() as client:
-            tasks = [
-                eval_with_retries(client, {
-                    "individual":      indiv,
-                    "execution_times": exec_times,
-                    "base_energy":     cfg["base_energy"],
-                    "idle_energy":     cfg["idle_energy"],
-                })
-                for indiv in population
-            ]
+            tasks     = [eval_with_retries(client, {
+                            "individual":      indiv,
+                            "execution_times": exec_times,
+                            "base_energy":     cfg["base_energy"],
+                            "idle_energy":     cfg["idle_energy"]
+                         })
+                         for indiv in population]
             fitnesses = await asyncio.gather(*tasks)
 
         best     = min(fitnesses)
-        mean_val = sum(fitnesses)/len(fitnesses)
+        mean_val = sum(fitnesses) / len(fitnesses)
 
-        # Prometheus metrics
+        # update metrics
         gen_counter.inc()
         ga_current_generation.set(gen)
         best_fitness.set(best)
@@ -301,16 +293,17 @@ async def run_ga(job_id: str, cfg: Dict):
 
         logger.info(f"Job {job_id} Gen {gen}: best={best:.4f}, mean={mean_val:.4f}")
 
-        # Update Redis status
+        # update Redis status
         rdb.hset(key, mapping={
             "generation": str(gen),
             "best":       str(prev_best if prev_best < float('inf') else best),
             "individual": json.dumps(best_individual) if best_individual else ""
         })
-        # Push & trim global best on improvement
+
+        # track global best and stagnation
         if best < prev_best:
             idx = fitnesses.index(best)
-            best_individual = population[idx]
+            best_individual  = population[idx]
             rdb.hset(key, mapping={
                 "generation": str(gen),
                 "best":       str(best),
@@ -321,56 +314,50 @@ async def run_ga(job_id: str, cfg: Dict):
             prev_best        = best
             no_improve_count = 0
         else:
-            if stagnation_limit is not None:
+            if stagnation_limit > 0:
                 no_improve_count += 1
+                if no_improve_count >= stagnation_limit:
+                    logger.info(
+                        f"Job {job_id}: no improvement for {no_improve_count} gens "
+                        f"(limit={stagnation_limit}), ending early at gen={gen}"
+                    )
+                    break
 
-        if stagnation_limit is not None and no_improve_count >= stagnation_limit:
-            logger.info(
-                f"Job {job_id}: no improvement for {no_improve_count} gens "
-                f"(limit={stagnation_limit}), ending early at gen={gen}"
-            )
-            break
-        # Migration round
+        # migration
         if gen % interval == 0:
             migrants_raw = rdb.lrange(MIGRATION_KEY, 0, num_islands - 1)
             migrants     = [json.loads(m) for m in migrants_raw]
-
             async with httpx.AsyncClient() as client:
-                tasks = [
-                    eval_with_retries(client, {
-                        "individual":      m,
-                        "execution_times": exec_times,
-                        "base_energy":     cfg["base_energy"],
-                        "idle_energy":     cfg["idle_energy"]
-                    })
-                    for m in migrants
-                ]
+                tasks        = [eval_with_retries(client, {
+                                    "individual":      m,
+                                    "execution_times": exec_times,
+                                    "base_energy":     cfg["base_energy"],
+                                    "idle_energy":     cfg["idle_energy"]
+                                 })
+                                 for m in migrants]
                 migrant_fits = await asyncio.gather(*tasks)
-
-            # Replace worst individuals
             pairs = list(zip(population, fitnesses))
             pairs.sort(key=lambda x: x[1], reverse=True)
             for i, m_fit in enumerate(migrant_fits):
                 pairs[i] = (migrants[i], m_fit)
             population = [ind for ind, _ in pairs]
-
-            # clear the list so next round only has new migrants
             rdb.delete(MIGRATION_KEY)
 
-        # Next generation
+        # next generation
         population = next_generation(population, fitnesses, cfg)
 
-    # Final result
+    # final result & cleanup
     final = {
         "best":       prev_best,
         "core_times": compute_core_times(best_individual, exec_times, cfg["num_cores"]),
         "metrics": {
-            "generations":      cfg["generations"],
+            "generations":      gen,  # actual last gen run
             "total_duration_s": sum(sample.value for sample in gen_duration.collect())
         }
     }
 
-    try:   
+    try:
+        blob_client = blob_service.get_blob_client(container=blob_container, blob=f"{job_id}.json")
         blob_client.upload_blob(json.dumps(final), overwrite=True)
         logger.info(f"Job {job_id}: results uploaded to Blob")
     except Exception as e:
