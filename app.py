@@ -95,6 +95,7 @@ class RunRequest(BaseModel):
     base_energy:      float = Field(..., gt=0)
     idle_energy:      float = Field(..., gt=0)
     seed:             Optional[int] = None
+    stagnation_limit: Optional[int] = Field(None, gt=1, description="Stop early if no improvement over this many gens")
 
 class RunResponse(BaseModel):
     job_id: str
@@ -227,14 +228,6 @@ def compute_core_times(individual: List[int],
         cores[c] += exec_times[i]
     return cores
 
-def compute_core_times(individual: List[int],
-                       exec_times:  List[float],
-                       num_cores:   int) -> List[float]:
-    cores = [0.0]*num_cores
-    for i, c in enumerate(individual):
-        cores[c] += exec_times[i]
-    return cores
-
 class ExecuteRequest(RunRequest):
     job_id: str = Field(..., description="UUID of the job to execute.")
 
@@ -273,8 +266,10 @@ async def run_ga(job_id: str, cfg: Dict):
     )
     ga_population_size.set(len(population))
 
-    prev_best       = float('inf')
-    best_individual = None
+    prev_best        = float('inf')
+    best_individual  = None
+    no_improve_count = 0
+    stagnation_limit = cfg.get("stagnation_limit")
 
     for gen in range(1, cfg["generations"] + 1):
         start = time.time()
@@ -312,7 +307,6 @@ async def run_ga(job_id: str, cfg: Dict):
             "best":       str(prev_best if prev_best < float('inf') else best),
             "individual": json.dumps(best_individual) if best_individual else ""
         })
-
         # Push & trim global best on improvement
         if best < prev_best:
             idx = fitnesses.index(best)
@@ -324,8 +318,18 @@ async def run_ga(job_id: str, cfg: Dict):
             })
             rdb.lpush(MIGRATION_KEY, json.dumps(best_individual))
             rdb.ltrim(MIGRATION_KEY, 0, num_islands - 1)
-            prev_best = best
+            prev_best        = best
+            no_improve_count = 0
+        else:
+            if stagnation_limit is not None:
+                no_improve_count += 1
 
+        if stagnation_limit is not None and no_improve_count >= stagnation_limit:
+            logger.info(
+                f"Job {job_id}: no improvement for {no_improve_count} gens "
+                f"(limit={stagnation_limit}), ending early at gen={gen}"
+            )
+            break
         # Migration round
         if gen % interval == 0:
             migrants_raw = rdb.lrange(MIGRATION_KEY, 0, num_islands - 1)
@@ -365,9 +369,14 @@ async def run_ga(job_id: str, cfg: Dict):
             "total_duration_s": sum(sample.value for sample in gen_duration.collect())
         }
     }
-    blob_client = blob_service.get_blob_client(blob_container, f"{job_id}.json")
-    blob_client.upload_blob(json.dumps(final), overwrite=True)
 
-    # Mark done
-    rdb.hset(key, "status", "done")
-    logger.info(f"Job {job_id}: completed and uploaded results")
+    try:   
+        blob_client.upload_blob(json.dumps(final), overwrite=True)
+        logger.info(f"Job {job_id}: results uploaded to Blob")
+    except Exception as e:
+        logger.exception(f"Job {job_id} failed during finalization: {e}")
+        rdb.hset(key, "status", "failed")
+        raise
+    finally:
+        rdb.hset(key, "status", "done")
+        logger.info(f"Job {job_id}: marked status=done in Redis")
