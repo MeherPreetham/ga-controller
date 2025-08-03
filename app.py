@@ -348,11 +348,13 @@ async def run_ga(job_id: str, cfg: Dict):
 
     # final result & cleanup
     final = {
-        "best":       prev_best,
-        "core_times": compute_core_times(best_individual, exec_times, cfg["num_cores"]),
+        "job_id":          job_id,
+        "best_fitness":    prev_best,
+        "best_individual": best_individual,
+        "core_times":      compute_core_times(best_individual, exec_times, cfg["num_cores"]),
         "metrics": {
-            "generations":      gen,  # actual last gen run
-            "total_duration_s": sum(sample.value for sample in gen_duration.collect())
+            "generations_executed": gen,
+            "total_duration_s":     sum(sample.value for sample in gen_duration.collect())
         }
     }
 
