@@ -270,138 +270,140 @@ def compute_core_times(individual: List[int],
 ########## MAIN GA LOOP #######################################
 async def run_ga(job_id: str, cfg: Dict):
     key             = f"job:{job_id}"
-    interval        = cfg["migration_interval"]
-    num_islands     = cfg["num_islands"]
-    prev_best       = float('inf')
-    best_individual = None
-    no_improve      = 0
-    stagnation_lim  = cfg.get("stagnation_limit") or 0
-
-    # generate execution times (shared seed)
-    base_seed  = cfg.get("seed") or 0
-    rng_exec   = random.Random(base_seed)
-    exec_times = [rng_exec.randint(1,10) for _ in range(cfg["num_tasks"])]
-    logger.info(f"Job {job_id}: exec_times (first 5): {exec_times[:5]}")
-
-    # per-island RNG
-    island_id = int(POD.rsplit("-",1)[-1]) if "-" in POD else 0
-    rng_pop   = random.Random(base_seed + island_id)
-
-    population = init_population(
-        cfg["population"],
-        cfg["num_tasks"],
-        cfg["num_cores"],
-        rng_pop
-    )
-    # record population size
-    ga_population_size.labels(pod=POD).set(len(population))
-
-    for gen in range(1, cfg["generations"] + 1):
-        start = time.time()
-
-        # parallel fitness eval
-        async with httpx.AsyncClient() as client:
-            tasks     = [
-                eval_with_retries(client, {
-                    "individual":      indiv,
-                    "execution_times": exec_times,
-                    "base_energy":     cfg["base_energy"],
-                    "idle_energy":     cfg["idle_energy"],
-                })
-                for indiv in population
-            ]
-            fitnesses = await asyncio.gather(*tasks)
-
-        best     = min(fitnesses)
-        mean_val = sum(fitnesses)/len(fitnesses)
-
-        # record metrics with pod label
-        gen_counter.labels(pod=POD).inc()
-        ga_current_generation.labels(pod=POD).set(gen)
-        best_fitness.labels(pod=POD).set(best)
-        mean_fitness.labels(pod=POD).set(mean_val)
-        gen_duration.labels(pod=POD).set(time.time() - start)
-        for f in fitnesses:
-            ga_fitness_distribution.labels(pod=POD).observe(f)
-
-        logger.info(f"Job {job_id} Gen {gen}: best={best:.4f}, mean={mean_val:.4f}")
-
-        # update Redis status
-        rdb.hset(key, mapping={
-            "generation": str(gen),
-            "best":       str(prev_best if prev_best < float('inf') else best),
-            "individual": json.dumps(best_individual) if best_individual else ""
-        })
-
-        # track global best & stagnation
-        if best < prev_best:
-            idx = fitnesses.index(best)
-            best_individual = population[idx]
-            rdb.hset(key, mapping={
-                "generation": str(gen),
-                "best":       str(best),
-                "individual": json.dumps(best_individual)
-            })
-            rdb.lpush(MIGRATION_KEY, json.dumps(best_individual))
-            rdb.ltrim(MIGRATION_KEY, 0, num_islands - 1)
-            prev_best = best
-            no_improve = 0
-        else:
-            if stagnation_lim > 0:
-                no_improve += 1
-                if no_improve >= stagnation_lim:
-                    logger.info(
-                        f"Job {job_id}: no improvement for {no_improve} gens "
-                        f"(limit={stagnation_lim}), ending at gen={gen}"
-                    )
-                    break
-
-        # migration step
-        if gen % interval == 0:
-            migrants_raw = rdb.lrange(MIGRATION_KEY, 0, num_islands - 1)
-            migrants     = [json.loads(m) for m in migrants_raw]
+    try:
+        interval        = cfg["migration_interval"]
+        num_islands     = cfg["num_islands"]
+        prev_best       = float('inf')
+        best_individual = None
+        no_improve      = 0
+        stagnation_lim  = cfg.get("stagnation_limit") or 0
+    
+        # generate execution times (shared seed)
+        base_seed  = cfg.get("seed") or 0
+        rng_exec   = random.Random(base_seed)
+        exec_times = [rng_exec.randint(1,10) for _ in range(cfg["num_tasks"])]
+        logger.info(f"Job {job_id}: exec_times (first 5): {exec_times[:5]}")
+    
+        # per-island RNG
+        island_id = int(POD.rsplit("-",1)[-1]) if "-" in POD else 0
+        rng_pop   = random.Random(base_seed + island_id)
+    
+        population = init_population(
+            cfg["population"],
+            cfg["num_tasks"],
+            cfg["num_cores"],
+            rng_pop
+        )
+        # record population size
+        ga_population_size.labels(pod=POD).set(len(population))
+    
+        for gen in range(1, cfg["generations"] + 1):
+            start = time.time()
+    
+            # parallel fitness eval
             async with httpx.AsyncClient() as client:
-                tasks        = [
+                tasks     = [
                     eval_with_retries(client, {
-                        "individual":      m,
+                        "individual":      indiv,
                         "execution_times": exec_times,
                         "base_energy":     cfg["base_energy"],
-                        "idle_energy":     cfg["idle_energy"]
+                        "idle_energy":     cfg["idle_energy"],
                     })
-                    for m in migrants
+                    for indiv in population
                 ]
-                migrant_fits = await asyncio.gather(*tasks)
-            pairs = list(zip(population, fitnesses))
-            pairs.sort(key=lambda x: x[1], reverse=True)
-            for i, fit in enumerate(migrant_fits):
-                pairs[i] = (migrants[i], fit)
-            population = [ind for ind,_ in pairs]
-            rdb.delete(MIGRATION_KEY)
-
-        # next gen
-        population = next_generation(population, fitnesses, cfg)
-
-    # build final result (include best individual)
-    final = {
-        "job_id":           job_id,
-        "best_fitness":     prev_best,
-        "best_individual":  best_individual,
-        "core_times":       compute_core_times(best_individual, exec_times, cfg["num_cores"]),
-        "metrics": {
-            "generations_executed": gen,
-            "total_duration_s":     sum(sample.value for sample in gen_duration.collect())
+                fitnesses = await asyncio.gather(*tasks)
+    
+            best     = min(fitnesses)
+            mean_val = sum(fitnesses)/len(fitnesses)
+    
+            # record metrics with pod label
+            gen_counter.labels(pod=POD).inc()
+            ga_current_generation.labels(pod=POD).set(gen)
+            best_fitness.labels(pod=POD).set(best)
+            mean_fitness.labels(pod=POD).set(mean_val)
+            gen_duration.labels(pod=POD).set(time.time() - start)
+            for f in fitnesses:
+                ga_fitness_distribution.labels(pod=POD).observe(f)
+    
+            logger.info(f"Job {job_id} Gen {gen}: best={best:.4f}, mean={mean_val:.4f}")
+    
+            # update Redis status
+            rdb.hset(key, mapping={
+                "generation": str(gen),
+                "best":       str(prev_best if prev_best < float('inf') else best),
+                "individual": json.dumps(best_individual) if best_individual else ""
+            })
+    
+            # track global best & stagnation
+            if best < prev_best:
+                idx = fitnesses.index(best)
+                best_individual = population[idx]
+                rdb.hset(key, mapping={
+                    "generation": str(gen),
+                    "best":       str(best),
+                    "individual": json.dumps(best_individual)
+                })
+                rdb.lpush(MIGRATION_KEY, json.dumps(best_individual))
+                rdb.ltrim(MIGRATION_KEY, 0, num_islands - 1)
+                prev_best = best
+                no_improve = 0
+            else:
+                if stagnation_lim > 0:
+                    no_improve += 1
+                    if no_improve >= stagnation_lim:
+                        logger.info(
+                            f"Job {job_id}: no improvement for {no_improve} gens "
+                            f"(limit={stagnation_lim}), ending at gen={gen}"
+                        )
+                        break
+    
+            # migration step
+            if gen % interval == 0:
+                migrants_raw = rdb.lrange(MIGRATION_KEY, 0, num_islands - 1)
+                migrants     = [json.loads(m) for m in migrants_raw]
+                async with httpx.AsyncClient() as client:
+                    tasks        = [
+                        eval_with_retries(client, {
+                            "individual":      m,
+                            "execution_times": exec_times,
+                            "base_energy":     cfg["base_energy"],
+                            "idle_energy":     cfg["idle_energy"]
+                        })
+                        for m in migrants
+                    ]
+                    migrant_fits = await asyncio.gather(*tasks)
+                pairs = list(zip(population, fitnesses))
+                pairs.sort(key=lambda x: x[1], reverse=True)
+                for i, fit in enumerate(migrant_fits):
+                    pairs[i] = (migrants[i], fit)
+                population = [ind for ind,_ in pairs]
+                rdb.delete(MIGRATION_KEY)
+    
+            # next gen
+            population = next_generation(population, fitnesses, cfg)
+    
+        # build final result (include best individual)
+        final = {
+            "job_id":           job_id,
+            "best_fitness":     prev_best,
+            "best_individual":  best_individual,
+            "core_times":       compute_core_times(best_individual, exec_times, cfg["num_cores"]),
+            "metrics": {
+                "generations_executed": gen,
+                "total_duration_s":     sum(sample.value for sample in gen_duration.collect())
+            }
         }
-    }
-
-    # upload to Blob Storage
-    try:
         blob_client = blob_service.get_blob_client(container=blob_container, blob=f"{job_id}.json")
         blob_client.upload_blob(json.dumps(final), overwrite=True)
         logger.info(f"Job {job_id}: results uploaded to Blob")
     except Exception as e:
-        logger.exception(f"Job {job_id} failed during finalization: {e}")
+        # catches ANY exception in the GA loop or upload
+        logger.exception(f"Job {job_id} failed: {e}")
         rdb.hset(key, "status", "failed")
-        raise
-    finally:
+    else:
+        # only if no exception at all
         rdb.hset(key, "status", "done")
-        logger.info(f"Job {job_id}: marked status=done in Redis")
+    finally:
+        # clean up the migrant list
+        rdb.delete(MIGRATION_KEY)
+        logger.info(f"Job {job_id}: cleanup complete")
