@@ -18,7 +18,6 @@ from prometheus_client import (
     Gauge,
     Histogram,
     generate_latest,
-    CollectorRegistry,
     CONTENT_TYPE_LATEST
 )
 from azure.storage.blob import BlobServiceClient
@@ -30,22 +29,44 @@ logging.basicConfig(
 )
 logger = logging.getLogger("ga-controller")
 
-################### POD ID FOR METRICS #########################
+########## POD ID FOR METRICS ##################################
 POD = os.getenv("POD_NAME", "unknown")
 
 ########## PROMETHEUS METRICS ##################################
-REGISTRY = CollectorRegistry(auto_describe=False)
-gen_counter = Counter('ga_generations_total', '…', labelnames=['pod'], registry=REGISTRY)
-
-gen_counter          = Counter('ga_generations_total', 'Total GA generations', labelnames=['pod'], registry=REGISTRY)
-best_fitness         = Gauge('ga_best_fitness', 'Best fitness per generation', labelnames=['pod'], registry=REGISTRY)
-mean_fitness         = Gauge('ga_mean_fitness', 'Mean fitness per generation', labelnames=['pod'], registry=REGISTRY)
-gen_duration         = Gauge('ga_generation_seconds', 'Seconds per generation', labelnames=['pod'], registry=REGISTRY)
-ga_population_size   = Gauge('ga_population_size', 'Population size used by the GA')
-ga_current_generation= Gauge('ga_current_generation', 'Current generation index of the GA')
+gen_counter            = Counter(
+    'ga_generations_total',
+    'Total GA generations',
+    ['pod']
+)
+best_fitness           = Gauge(
+    'ga_best_fitness',
+    'Best fitness per generation',
+    ['pod']
+)
+mean_fitness           = Gauge(
+    'ga_mean_fitness',
+    'Mean fitness per generation',
+    ['pod']
+)
+gen_duration           = Gauge(
+    'ga_generation_seconds',
+    'Seconds per generation',
+    ['pod']
+)
+ga_population_size     = Gauge(
+    'ga_population_size',
+    'Population size used by the GA',
+    ['pod']
+)
+ga_current_generation  = Gauge(
+    'ga_current_generation',
+    'Current generation index of the GA',
+    ['pod']
+)
 ga_fitness_distribution = Histogram(
     'ga_fitness_distribution',
     'Histogram of fitness scores across the population',
+    ['pod'],
     buckets=[i * 0.1 for i in range(21)]
 )
 
@@ -69,7 +90,7 @@ blob_container = os.getenv("BLOB_CONTAINER")
 try:
     blob_service.create_container(blob_container)
 except Exception:
-    pass  # container exists or cannot be created
+    pass  # container already exists or cannot be created
 
 ########## EVALUATOR SERVICE CONFIG ############################
 EVALUATOR_HOST = os.getenv("EVALUATOR_HOST", "ga-evaluator")
@@ -92,18 +113,21 @@ def metrics():
 
 ########## REQUEST / RESPONSE MODELS ############################
 class RunRequest(BaseModel):
-    num_tasks:        int   = Field(..., gt=0)
-    num_cores:        int   = Field(..., gt=0)
-    population:       int   = Field(..., gt=0)
-    generations:      int   = Field(..., gt=0)
-    crossover_rate:   float = Field(..., ge=0, le=1)
-    mutation_rate:    float = Field(..., ge=0, le=1)
-    migration_interval:int   = Field(..., gt=0)
-    num_islands:      int   = Field(..., gt=0)
-    base_energy:      float = Field(..., gt=0)
-    idle_energy:      float = Field(..., gt=0)
-    seed:             Optional[int] = None
-    stagnation_limit: Optional[int] = Field(None, gt=1, description="Stop early if no improvement over this many gens")
+    num_tasks:         int    = Field(..., gt=0)
+    num_cores:         int    = Field(..., gt=0)
+    population:        int    = Field(..., gt=0)
+    generations:       int    = Field(..., gt=0)
+    crossover_rate:    float  = Field(..., ge=0, le=1)
+    mutation_rate:     float  = Field(..., ge=0, le=1)
+    migration_interval:int    = Field(..., gt=0)
+    num_islands:       int    = Field(..., gt=0)
+    base_energy:       float  = Field(..., gt=0)
+    idle_energy:       float  = Field(..., gt=0)
+    seed:              Optional[int] = None
+    stagnation_limit:  Optional[int] = Field(
+        None, gt=1,
+        description="Stop early if no improvement over this many gens"
+    )
 
 class RunResponse(BaseModel):
     job_id: str
@@ -120,7 +144,7 @@ async def eval_with_retries(
 ) -> float:
     for attempt in range(1, retries + 1):
         try:
-            resp = await client.post(EVALUATOR_URL, json=payload, timeout=5.0)
+            resp = await client.post(EVALUATOR_URL, json=payload, timeout=10.0)
             resp.raise_for_status()
             return resp.json()["fitness"]
         except Exception as e:
@@ -132,7 +156,7 @@ async def eval_with_retries(
 ########### API ENDPOINTS ######################################
 @app.post("/run", response_model=RunResponse)
 async def start_run(req: RunRequest, bg: BackgroundTasks):
-    job_id    = str(uuid.uuid4())
+    job_id = str(uuid.uuid4())
     redis_key = f"job:{job_id}"
     # initialize status in Redis
     rdb.hset(redis_key, mapping={
@@ -140,23 +164,25 @@ async def start_run(req: RunRequest, bg: BackgroundTasks):
         "generation": "0",
         "best":       ""
     })
-    # launch GA in background
+
+    # background GA for this pod
     bg.add_task(run_ga, job_id, req.dict())
 
+    # fan-out to all islands
     async def fan_out():
         async with httpx.AsyncClient() as client:
             tasks = []
             for i in range(req.num_islands):
                 host = (
-                  f"ga-controller-{i}"
-                  f".ga-controller-headless.default.svc.cluster.local:8000"
+                    f"ga-controller-{i}"
+                    f".ga-controller-headless.default.svc.cluster.local:8000"
                 )
                 payload = {"job_id": job_id, **req.dict()}
                 tasks.append(
                     client.post(f"http://{host}/execute", json=payload, timeout=10.0)
                 )
-            # run all calls in parallel
             await asyncio.gather(*tasks, return_exceptions=True)
+
     bg.add_task(fan_out)
     return RunResponse(job_id=job_id)
 
@@ -192,7 +218,7 @@ def result(job_id: str):
     )
     blob_data = blob_client.download_blob().readall()
     return json.loads(blob_data)
-    
+
 ########## GA UTILITIES #######################################
 def init_population(pop_size: int, num_tasks: int,
                     num_cores: int, rng: random.Random
@@ -218,8 +244,7 @@ def next_generation(population: List[List[int]],
     # Crossover
     offspring = []
     for i in range(0, pop_size, 2):
-        p1 = selected[i]
-        p2 = selected[(i+1) % pop_size]
+        p1, p2 = selected[i], selected[(i+1) % pop_size]
         if random.random() < cfg['crossover_rate']:
             pt = random.randint(1, len(p1)-1)
             offspring += [p1[:pt] + p2[pt:], p2[:pt] + p1[pt:]]
@@ -249,41 +274,48 @@ async def run_ga(job_id: str, cfg: Dict):
     num_islands     = cfg["num_islands"]
     prev_best       = float('inf')
     best_individual = None
-    no_improve_count= 0
-    stagnation_limit= cfg.get("stagnation_limit") or 0
+    no_improve      = 0
+    stagnation_lim  = cfg.get("stagnation_limit") or 0
 
-    # generate execution times
+    # generate execution times (shared seed)
     base_seed  = cfg.get("seed") or 0
     rng_exec   = random.Random(base_seed)
     exec_times = [rng_exec.randint(1,10) for _ in range(cfg["num_tasks"])]
     logger.info(f"Job {job_id}: exec_times (first 5): {exec_times[:5]}")
 
-    # island-specific seed
-    pod_name  = os.getenv("POD_NAME", "ga-island-0")
-    island_id = int(pod_name.rsplit("-", 1)[-1])
+    # per-island RNG
+    island_id = int(POD.rsplit("-",1)[-1]) if "-" in POD else 0
     rng_pop   = random.Random(base_seed + island_id)
 
-    population = init_population(cfg["population"], cfg["num_tasks"], cfg["num_cores"], rng_pop)
-    ga_population_size.set(len(population))
+    population = init_population(
+        cfg["population"],
+        cfg["num_tasks"],
+        cfg["num_cores"],
+        rng_pop
+    )
+    # record population size
+    ga_population_size.labels(pod=POD).set(len(population))
 
     for gen in range(1, cfg["generations"] + 1):
         start = time.time()
 
-        # parallel eval
+        # parallel fitness eval
         async with httpx.AsyncClient() as client:
-            tasks     = [eval_with_retries(client, {
-                            "individual":      indiv,
-                            "execution_times": exec_times,
-                            "base_energy":     cfg["base_energy"],
-                            "idle_energy":     cfg["idle_energy"]
-                         })
-                         for indiv in population]
+            tasks     = [
+                eval_with_retries(client, {
+                    "individual":      indiv,
+                    "execution_times": exec_times,
+                    "base_energy":     cfg["base_energy"],
+                    "idle_energy":     cfg["idle_energy"],
+                })
+                for indiv in population
+            ]
             fitnesses = await asyncio.gather(*tasks)
 
         best     = min(fitnesses)
-        mean_val = sum(fitnesses) / len(fitnesses)
+        mean_val = sum(fitnesses)/len(fitnesses)
 
-        # update metrics
+        # record metrics with pod label
         gen_counter.labels(pod=POD).inc()
         ga_current_generation.labels(pod=POD).set(gen)
         best_fitness.labels(pod=POD).set(best)
@@ -301,10 +333,10 @@ async def run_ga(job_id: str, cfg: Dict):
             "individual": json.dumps(best_individual) if best_individual else ""
         })
 
-        # track global best and stagnation
+        # track global best & stagnation
         if best < prev_best:
             idx = fitnesses.index(best)
-            best_individual  = population[idx]
+            best_individual = population[idx]
             rdb.hset(key, mapping={
                 "generation": str(gen),
                 "best":       str(best),
@@ -312,42 +344,44 @@ async def run_ga(job_id: str, cfg: Dict):
             })
             rdb.lpush(MIGRATION_KEY, json.dumps(best_individual))
             rdb.ltrim(MIGRATION_KEY, 0, num_islands - 1)
-            prev_best        = best
-            no_improve_count = 0
+            prev_best = best
+            no_improve = 0
         else:
-            if stagnation_limit > 0:
-                no_improve_count += 1
-                if no_improve_count >= stagnation_limit:
+            if stagnation_lim > 0:
+                no_improve += 1
+                if no_improve >= stagnation_lim:
                     logger.info(
-                        f"Job {job_id}: no improvement for {no_improve_count} gens "
-                        f"(limit={stagnation_limit}), ending early at gen={gen}"
+                        f"Job {job_id}: no improvement for {no_improve} gens "
+                        f"(limit={stagnation_lim}), ending at gen={gen}"
                     )
                     break
 
-        # migration
+        # migration step
         if gen % interval == 0:
             migrants_raw = rdb.lrange(MIGRATION_KEY, 0, num_islands - 1)
             migrants     = [json.loads(m) for m in migrants_raw]
             async with httpx.AsyncClient() as client:
-                tasks        = [eval_with_retries(client, {
-                                    "individual":      m,
-                                    "execution_times": exec_times,
-                                    "base_energy":     cfg["base_energy"],
-                                    "idle_energy":     cfg["idle_energy"]
-                                 })
-                                 for m in migrants]
+                tasks        = [
+                    eval_with_retries(client, {
+                        "individual":      m,
+                        "execution_times": exec_times,
+                        "base_energy":     cfg["base_energy"],
+                        "idle_energy":     cfg["idle_energy"]
+                    })
+                    for m in migrants
+                ]
                 migrant_fits = await asyncio.gather(*tasks)
             pairs = list(zip(population, fitnesses))
             pairs.sort(key=lambda x: x[1], reverse=True)
-            for i, m_fit in enumerate(migrant_fits):
-                pairs[i] = (migrants[i], m_fit)
-            population = [ind for ind, _ in pairs]
+            for i, fit in enumerate(migrant_fits):
+                pairs[i] = (migrants[i], fit)
+            population = [ind for ind,_ in pairs]
             rdb.delete(MIGRATION_KEY)
 
-        # next generation
+        # next gen
         population = next_generation(population, fitnesses, cfg)
 
-    # final result & cleanup
+    # build final result (include best individual)
     final = {
         "job_id":           job_id,
         "best_fitness":     prev_best,
