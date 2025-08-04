@@ -30,9 +30,12 @@ logging.basicConfig(
 )
 logger = logging.getLogger("ga-controller")
 
+################### POD ID FOR METRICS #########################
+POD = os.getenv("POD_NAME", "unknown")
+
 ########## PROMETHEUS METRICS ##################################
 REGISTRY = CollectorRegistry(auto_describe=False)
-POD = os.getenv("POD_NAME", "unknown")
+gen_counter = Counter('ga_generations_total', '…', labelnames=['pod'], registry=REGISTRY)
 
 gen_counter          = Counter('ga_generations_total', 'Total GA generations', labelnames=['pod'], registry=REGISTRY)
 best_fitness         = Gauge('ga_best_fitness', 'Best fitness per generation', labelnames=['pod'], registry=REGISTRY)
@@ -83,9 +86,8 @@ def healthz():
 
 @app.get("/metrics")
 def metrics():
-    for m in [gen_counter, best_fitness, mean_fitness, gen_duration]:
-        m.labels(pod=POD)
-    data = generate_latest(REGISTRY)
+    # Return all metrics, with 'pod' label baked in
+    data = generate_latest()
     return Response(content=data, media_type=CONTENT_TYPE_LATEST)
 
 ########## REQUEST / RESPONSE MODELS ############################
@@ -105,6 +107,9 @@ class RunRequest(BaseModel):
 
 class RunResponse(BaseModel):
     job_id: str
+
+class ExecuteRequest(RunRequest):
+    job_id: str = Field(..., description="UUID of the job to execute")
 
 ########## HELPER: HTTPX WITH RETRIES ##########################
 async def eval_with_retries(
@@ -153,8 +158,13 @@ async def start_run(req: RunRequest, bg: BackgroundTasks):
             # run all calls in parallel
             await asyncio.gather(*tasks, return_exceptions=True)
     bg.add_task(fan_out)
-
     return RunResponse(job_id=job_id)
+
+@app.post("/execute")
+async def execute_island(req: ExecuteRequest):
+    # each island runs its own GA loop
+    await run_ga(req.job_id, req.dict(exclude={"job_id"}))
+    return {"status": "accepted", "pod": POD}
 
 @app.get("/run/{job_id}/status")
 def status(job_id: str):
@@ -162,29 +172,27 @@ def status(job_id: str):
     if not rdb.exists(key):
         return {"error": "not found"}
     data = rdb.hgetall(key)
-    individual_json = data.get("individual", "")
     return {
         "status":     data.get("status"),
         "generation": int(data.get("generation", 0)),
         "best":       float(data["best"]) if data.get("best") else None,
-        "individual": json.loads(individual_json) if individual_json else None
+        "individual": json.loads(data.get("individual", "[]"))
     }
 
 @app.get("/run/{job_id}/result")
 def result(job_id: str):
     key = f"job:{job_id}"
-    # if still in Redis and not done
+    # still running?
     if rdb.exists(key) and rdb.hget(key, "status") != "done":
         return {"error": "still running"}
-
-    # otherwise fetch from Blob Storage
+    # fetch final result from Blob
     blob_client = blob_service.get_blob_client(
         container=blob_container,
         blob=f"{job_id}.json"
     )
     blob_data = blob_client.download_blob().readall()
     return json.loads(blob_data)
-
+    
 ########## GA UTILITIES #######################################
 def init_population(pop_size: int, num_tasks: int,
                     num_cores: int, rng: random.Random
@@ -234,19 +242,6 @@ def compute_core_times(individual: List[int],
         cores[c] += exec_times[i]
     return cores
 
-class ExecuteRequest(RunRequest):
-    job_id: str = Field(..., description="UUID of the job to execute.")
-
-@app.post("/execute")
-async def execute_island(req: ExecuteRequest):
-    """
-    Internal call: each replica receives the same job_id + GA params
-    and runs its island in-process.
-    """
-    # Kick off the GA loop on this pod (await so errors bubble)
-    await run_ga(req.job_id, req.dict(exclude={"job_id"}))
-    return {"status": "accepted", "pod": os.getenv("POD_NAME")}
-
 ########## MAIN GA LOOP #######################################
 async def run_ga(job_id: str, cfg: Dict):
     key             = f"job:{job_id}"
@@ -289,13 +284,13 @@ async def run_ga(job_id: str, cfg: Dict):
         mean_val = sum(fitnesses) / len(fitnesses)
 
         # update metrics
-        gen_counter.inc()
-        ga_current_generation.set(gen)
-        best_fitness.set(best)
-        mean_fitness.set(mean_val)
-        gen_duration.set(time.time() - start)
+        gen_counter.labels(pod=POD).inc()
+        ga_current_generation.labels(pod=POD).set(gen)
+        best_fitness.labels(pod=POD).set(best)
+        mean_fitness.labels(pod=POD).set(mean_val)
+        gen_duration.labels(pod=POD).set(time.time() - start)
         for f in fitnesses:
-            ga_fitness_distribution.observe(f)
+            ga_fitness_distribution.labels(pod=POD).observe(f)
 
         logger.info(f"Job {job_id} Gen {gen}: best={best:.4f}, mean={mean_val:.4f}")
 
@@ -354,14 +349,17 @@ async def run_ga(job_id: str, cfg: Dict):
 
     # final result & cleanup
     final = {
-        "best":       prev_best,
-        "core_times": compute_core_times(best_individual, exec_times, cfg["num_cores"]),
+        "job_id":           job_id,
+        "best_fitness":     prev_best,
+        "best_individual":  best_individual,
+        "core_times":       compute_core_times(best_individual, exec_times, cfg["num_cores"]),
         "metrics": {
-            "generations":      gen,  # actual last gen run
-            "total_duration_s": sum(sample.value for sample in gen_duration.collect())
+            "generations_executed": gen,
+            "total_duration_s":     sum(sample.value for sample in gen_duration.collect())
         }
     }
 
+    # upload to Blob Storage
     try:
         blob_client = blob_service.get_blob_client(container=blob_container, blob=f"{job_id}.json")
         blob_client.upload_blob(json.dumps(final), overwrite=True)
