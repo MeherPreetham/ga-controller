@@ -269,38 +269,40 @@ def compute_core_times(individual: List[int],
 
 ########## MAIN GA LOOP #######################################
 async def run_ga(job_id: str, cfg: Dict):
-    key             = f"job:{job_id}"
+    key = f"job:{job_id}"
+    stopped_due_to_stagnation = False
+
+    # Pull parameters
+    interval       = cfg["migration_interval"]
+    num_islands    = cfg["num_islands"]
+    stagnation_lim = cfg.get("stagnation_limit") or 0
+
+    prev_best       = float('inf')
+    best_individual = None
+    no_improve      = 0
+
+    # Generate execution times
+    base_seed  = cfg.get("seed") or 0
+    rng_exec   = random.Random(base_seed)
+    exec_times = [rng_exec.randint(1,10) for _ in range(cfg["num_tasks"])]
+    logger.info(f"Job {job_id}: exec_times (first 5): {exec_times[:5]}")
+
+    # Island‐specific RNG
+    pod_name  = os.getenv("POD_NAME", "ga-island-0")
+    island_id = int(pod_name.rsplit("-",1)[-1]) if "-" in pod_name else 0
+    rng_pop   = random.Random(base_seed + island_id)
+
+    # Initialize population
+    population = init_population(
+        cfg["population"], cfg["num_tasks"], cfg["num_cores"], rng_pop
+    )
+    ga_population_size.labels(pod=POD).set(len(population))
+    
     try:
-        interval        = cfg["migration_interval"]
-        num_islands     = cfg["num_islands"]
-        prev_best       = float('inf')
-        best_individual = None
-        no_improve      = 0
-        stagnation_lim  = cfg.get("stagnation_limit") or 0
-    
-        # generate execution times (shared seed)
-        base_seed  = cfg.get("seed") or 0
-        rng_exec   = random.Random(base_seed)
-        exec_times = [rng_exec.randint(1,10) for _ in range(cfg["num_tasks"])]
-        logger.info(f"Job {job_id}: exec_times (first 5): {exec_times[:5]}")
-    
-        # per-island RNG
-        island_id = int(POD.rsplit("-",1)[-1]) if "-" in POD else 0
-        rng_pop   = random.Random(base_seed + island_id)
-    
-        population = init_population(
-            cfg["population"],
-            cfg["num_tasks"],
-            cfg["num_cores"],
-            rng_pop
-        )
-        # record population size
-        ga_population_size.labels(pod=POD).set(len(population))
-    
         for gen in range(1, cfg["generations"] + 1):
             start = time.time()
-    
-            # parallel fitness eval
+
+            # parallel fitness evaluation
             async with httpx.AsyncClient() as client:
                 tasks     = [
                     eval_with_retries(client, {
@@ -312,9 +314,9 @@ async def run_ga(job_id: str, cfg: Dict):
                     for indiv in population
                 ]
                 fitnesses = await asyncio.gather(*tasks)
-    
+
             best     = min(fitnesses)
-            mean_val = sum(fitnesses)/len(fitnesses)
+            mean_val = sum(fitnesses) / len(fitnesses)
     
             # record metrics with pod label
             gen_counter.labels(pod=POD).inc()
@@ -324,10 +326,10 @@ async def run_ga(job_id: str, cfg: Dict):
             gen_duration.labels(pod=POD).set(time.time() - start)
             for f in fitnesses:
                 ga_fitness_distribution.labels(pod=POD).observe(f)
-    
+
             logger.info(f"Job {job_id} Gen {gen}: best={best:.4f}, mean={mean_val:.4f}")
-    
-            # update Redis status
+
+            # update Redis with the previous best (so status endpoint can show progress)
             rdb.hset(key, mapping={
                 "generation": str(gen),
                 "best":       str(prev_best if prev_best < float('inf') else best),
@@ -336,8 +338,12 @@ async def run_ga(job_id: str, cfg: Dict):
     
             # track global best & stagnation
             if best < prev_best:
-                idx = fitnesses.index(best)
+                idx            = fitnesses.index(best)
                 best_individual = population[idx]
+                prev_best       = best
+                no_improve      = 0
+
+                # publish new global best for migration
                 rdb.hset(key, mapping={
                     "generation": str(gen),
                     "best":       str(best),
@@ -345,15 +351,14 @@ async def run_ga(job_id: str, cfg: Dict):
                 })
                 rdb.lpush(MIGRATION_KEY, json.dumps(best_individual))
                 rdb.ltrim(MIGRATION_KEY, 0, num_islands - 1)
-                prev_best = best
-                no_improve = 0
-            else:
+             else:
                 if stagnation_lim > 0:
                     no_improve += 1
                     if no_improve >= stagnation_lim:
+                        stopped_due_to_stagnation = True
                         logger.info(
                             f"Job {job_id}: no improvement for {no_improve} gens "
-                            f"(limit={stagnation_lim}), ending at gen={gen}"
+                            f"(limit={stagnation_lim}), stopping early at gen={gen}"
                         )
                         break
     
@@ -388,6 +393,7 @@ async def run_ga(job_id: str, cfg: Dict):
             "best_fitness":     prev_best,
             "best_individual":  best_individual,
             "core_times":       compute_core_times(best_individual, exec_times, cfg["num_cores"]),
+            "GA_runtime": time.time() - start, 
             "metrics": {
                 "generations_executed": gen,
                 "total_duration_s":     sum(sample.value for sample in gen_duration.collect())
