@@ -208,14 +208,15 @@ def status(job_id: str):
 @app.get("/run/{job_id}/result")
 def result(job_id: str):
     key = f"job:{job_id}"
-    # still running?
-    if rdb.exists(key) and rdb.hget(key, "status") != "done":
+    if not rdb.exists(key):
+        return {"error": "not found"}
+    status = rdb.hget(key, "status")
+    if status == "running":
         return {"error": "still running"}
-    # fetch final result from Blob
-    blob_client = blob_service.get_blob_client(
-        container=blob_container,
-        blob=f"{job_id}.json"
-    )
+    if status == "failed":
+        return {"error": "job failed"}
+
+    blob_client = blob_service.get_blob_client(container=blob_container, blob=f"{job_id}.json")
     blob_data = blob_client.download_blob().readall()
     return json.loads(blob_data)
 
