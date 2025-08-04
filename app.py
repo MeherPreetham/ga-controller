@@ -351,7 +351,7 @@ async def run_ga(job_id: str, cfg: Dict):
                 })
                 rdb.lpush(MIGRATION_KEY, json.dumps(best_individual))
                 rdb.ltrim(MIGRATION_KEY, 0, num_islands - 1)
-             else:
+            else:
                 if stagnation_lim > 0:
                     no_improve += 1
                     if no_improve >= stagnation_lim:
