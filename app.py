@@ -18,6 +18,7 @@ from prometheus_client import (
     Gauge,
     Histogram,
     generate_latest,
+    CollectorRegistry,
     CONTENT_TYPE_LATEST
 )
 from azure.storage.blob import BlobServiceClient
@@ -30,12 +31,15 @@ logging.basicConfig(
 logger = logging.getLogger("ga-controller")
 
 ########## PROMETHEUS METRICS ##################################
-gen_counter          = Counter('ga_generations_total',       'Total GA generations')
-best_fitness         = Gauge('ga_best_fitness',             'Best fitness per generation')
-mean_fitness         = Gauge('ga_mean_fitness',             'Mean fitness per generation')
-gen_duration         = Gauge('ga_generation_seconds',       'Seconds per generation')
-ga_population_size   = Gauge('ga_population_size',          'Population size used by the GA')
-ga_current_generation= Gauge('ga_current_generation',       'Current generation index of the GA')
+REGISTRY = CollectorRegistry(auto_describe=False)
+POD = os.getenv("POD_NAME", "unknown")
+
+gen_counter          = Counter('ga_generations_total', 'Total GA generations', labelnames=['pod'], registry=REGISTRY)
+best_fitness         = Gauge('ga_best_fitness', 'Best fitness per generation', labelnames=['pod'], registry=REGISTRY)
+mean_fitness         = Gauge('ga_mean_fitness', 'Mean fitness per generation', labelnames=['pod'], registry=REGISTRY)
+gen_duration         = Gauge('ga_generation_seconds', 'Seconds per generation', labelnames=['pod'], registry=REGISTRY)
+ga_population_size   = Gauge('ga_population_size', 'Population size used by the GA')
+ga_current_generation= Gauge('ga_current_generation', 'Current generation index of the GA')
 ga_fitness_distribution = Histogram(
     'ga_fitness_distribution',
     'Histogram of fitness scores across the population',
@@ -79,7 +83,9 @@ def healthz():
 
 @app.get("/metrics")
 def metrics():
-    data = generate_latest()
+    for m in [gen_counter, best_fitness, mean_fitness, gen_duration]:
+        m.labels(pod=POD)
+    data = generate_latest(REGISTRY)
     return Response(content=data, media_type=CONTENT_TYPE_LATEST)
 
 ########## REQUEST / RESPONSE MODELS ############################
@@ -348,13 +354,11 @@ async def run_ga(job_id: str, cfg: Dict):
 
     # final result & cleanup
     final = {
-        "job_id":          job_id,
-        "best_fitness":    prev_best,
-        "best_individual": best_individual,
-        "core_times":      compute_core_times(best_individual, exec_times, cfg["num_cores"]),
+        "best":       prev_best,
+        "core_times": compute_core_times(best_individual, exec_times, cfg["num_cores"]),
         "metrics": {
-            "generations_executed": gen,
-            "total_duration_s":     sum(sample.value for sample in gen_duration.collect())
+            "generations":      gen,  # actual last gen run
+            "total_duration_s": sum(sample.value for sample in gen_duration.collect())
         }
     }
 
