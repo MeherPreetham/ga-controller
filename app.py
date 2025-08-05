@@ -332,6 +332,7 @@ async def run_ga(job_id: str, cfg: Dict):
             best_fitness.labels(pod=POD, job=job_id).set(best)
             mean_fitness.labels(pod=POD, job=job_id).set(mean_val)
             gen_duration.labels(pod=POD, job=job_id).set(time.time() - start)
+            ga_fitness_distribution.labels(pod=POD, job=job_id).observe(f)
             for f in fitnesses:
                 ga_fitness_distribution.labels(pod=POD).observe(f)
 
