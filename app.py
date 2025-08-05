@@ -213,13 +213,25 @@ def result(job_id: str):
     status = rdb.hget(key, "status")
     if status == "running":
         return {"error": "still running"}
-    if status == "failed":
-        return {"error": "job failed"}
+        
+    data = rdb.hgetall(key)
+    response = {
+        "status":        status,
+        "generation":    int(data.get("generation", 0)),
+        "best_fitness":  float(data.get("best", 0.0)) if data.get("best") else None,
+        "individual":    json.loads(data.get("individual", "[]"))
+    }
 
-    blob_client = blob_service.get_blob_client(container=blob_container, blob=f"{job_id}.json")
-    blob_data = blob_client.download_blob().readall()
-    return json.loads(blob_data)
+if status == "done":
+        blob_client = blob_service.get_blob_client(
+            container=blob_container,
+            blob=f"{job_id}.json"
+        )
+        blob_data   = blob_client.download_blob().readall()
+        full_result = json.loads(blob_data)
+        response.update(full_result)
 
+    return response
 ########## GA UTILITIES #######################################
 def init_population(pop_size: int, num_tasks: int,
                     num_cores: int, rng: random.Random
