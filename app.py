@@ -41,7 +41,7 @@ gen_counter            = Counter(
 best_fitness           = Gauge(
     'ga_best_fitness',
     'Best fitness per generation',
-    ['pod', 'job']
+    ['pod', 'job', 'tasks']
 )
 mean_fitness           = Gauge(
     'ga_mean_fitness',
@@ -329,7 +329,7 @@ async def run_ga(job_id: str, cfg: Dict):
             # record metrics with pod label
             gen_counter.labels(pod=POD).inc()
             ga_current_generation.labels(pod=POD, job=job_id).set(gen)
-            best_fitness.labels(pod=POD, job=job_id).set(best)
+            best_fitness.labels(pod=POD, job=job_id, tasks=cfg['num_tasks']).set(best)
             mean_fitness.labels(pod=POD, job=job_id).set(mean_val)
             gen_duration.labels(pod=POD, job=job_id).set(time.time() - start)
             ga_fitness_distribution.labels(pod=POD, job=job_id).observe(f)
