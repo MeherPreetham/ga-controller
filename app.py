@@ -61,7 +61,7 @@ ga_current_generation  = Gauge(
 ga_fitness_distribution = Histogram(
     'ga_fitness_distribution',
     'Histogram of fitness scores across the population',
-    ['pod'],
+    ['pod', 'job'],
     buckets=[i * 0.1 for i in range(21)]
 )
 
