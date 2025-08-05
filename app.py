@@ -222,7 +222,7 @@ def result(job_id: str):
         "individual":    json.loads(data.get("individual", "[]"))
     }
 
-if status == "done":
+    if status == "done":
         blob_client = blob_service.get_blob_client(
             container=blob_container,
             blob=f"{job_id}.json"
@@ -373,7 +373,8 @@ async def run_ga(job_id: str, cfg: Dict):
                             f"Job {job_id}: no improvement for {no_improve} gens "
                             f"(limit={stagnation_lim}), stopping early at gen={gen}"
                         )
-                        break
+                        rdb.hset(f"job:{job_id}", "status", "stagnated")
+                        return
     
             # migration step
             if gen % interval == 0:
@@ -415,6 +416,10 @@ async def run_ga(job_id: str, cfg: Dict):
         blob_client = blob_service.get_blob_client(container=blob_container, blob=f"{job_id}.json")
         blob_client.upload_blob(json.dumps(final), overwrite=True)
         logger.info(f"Job {job_id}: results uploaded to Blob")
+    except asyncio.CancelledError:
+        logger.warning(f"Job {job_id} was interrupted")
+        rdb.hset(key, "status", "interrupted")
+        raise
     except Exception as e:
         # catches ANY exception in the GA loop or upload
         logger.exception(f"Job {job_id} failed: {e}")
