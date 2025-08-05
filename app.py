@@ -36,32 +36,37 @@ POD = os.getenv("POD_NAME", "unknown")
 gen_counter            = Counter(
     'ga_generations_total',
     'Total GA generations',
-    ['pod', 'job']
+    ['pod']
 )
 best_fitness           = Gauge(
     'ga_best_fitness',
     'Best fitness per generation',
-    ['pod', 'job', 'tasks']
+    ['pod']
 )
 mean_fitness           = Gauge(
     'ga_mean_fitness',
     'Mean fitness per generation',
-    ['pod', 'job']
+    ['pod']
 )
 gen_duration           = Gauge(
     'ga_generation_seconds',
     'Seconds per generation',
-    ['pod', 'job']
+    ['pod']
+)
+ga_population_size     = Gauge(
+    'ga_population_size',
+    'Population size used by the GA',
+    ['pod']
 )
 ga_current_generation  = Gauge(
     'ga_current_generation',
     'Current generation index of the GA',
-    ['pod', 'job']
+    ['pod']
 )
 ga_fitness_distribution = Histogram(
     'ga_fitness_distribution',
     'Histogram of fitness scores across the population',
-    ['pod', 'job'],
+    ['pod'],
     buckets=[i * 0.1 for i in range(21)]
 )
 
@@ -328,11 +333,10 @@ async def run_ga(job_id: str, cfg: Dict):
     
             # record metrics with pod label
             gen_counter.labels(pod=POD).inc()
-            ga_current_generation.labels(pod=POD, job=job_id).set(gen)
-            best_fitness.labels(pod=POD, job=job_id, tasks=cfg['num_tasks']).set(best)
-            mean_fitness.labels(pod=POD, job=job_id).set(mean_val)
-            gen_duration.labels(pod=POD, job=job_id).set(time.time() - start)
-            ga_fitness_distribution.labels(pod=POD, job=job_id).observe(f)
+            ga_current_generation.labels(pod=POD).set(gen)
+            best_fitness.labels(pod=POD).set(best)
+            mean_fitness.labels(pod=POD).set(mean_val)
+            gen_duration.labels(pod=POD).set(time.time() - start)
             for f in fitnesses:
                 ga_fitness_distribution.labels(pod=POD).observe(f)
 
