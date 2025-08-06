@@ -435,6 +435,10 @@ async def run_ga(job_id: str, cfg: Dict):
     }
     blob_client = blob_service.get_blob_client(container=blob_container, blob=f"{job_id}.txt")
     blob_client.upload_blob(json.dumps(final), overwrite=True)
-    rdb.hset(key, "status", final["status"])
+    rdb.hset(key, mapping={
+        "status": final["status"],
+        "generation": str(gen),
+        "best": str(prev_best)
+    })
     rdb.delete(MIGRATION_KEY)
     logger.info(f"Job {job_id}: cleanup complete")
