@@ -7,9 +7,10 @@ import random
 import json
 import logging
 import asyncio
+import socket
 
 from typing import List, Optional, Dict
-from fastapi import FastAPI, BackgroundTasks, Response
+from fastapi import FastAPI, Response
 from pydantic import BaseModel, Field
 import httpx
 import redis
@@ -102,6 +103,10 @@ EVALUATOR_HOST = os.getenv("EVALUATOR_HOST", "ga-evaluator")
 EVALUATOR_PORT = os.getenv("EVALUATOR_PORT", "5000")
 EVALUATOR_URL  = f"http://{EVALUATOR_HOST}:{EVALUATOR_PORT}/evaluate"
 
+########## CONTROLLER DISCOVERY CONFIG ########################
+CONTROLLER_HEADLESS = "ga-controller-headless.default.svc.cluster.local"
+CONTROLLER_PORT     = 8000
+
 ########## FASTAPI APP ##########################################
 app = FastAPI()
 
@@ -112,7 +117,6 @@ def healthz():
 
 @app.get("/metrics")
 def metrics():
-    # Return all metrics, with 'pod' label baked in
     data = generate_latest()
     return Response(content=data, media_type=CONTENT_TYPE_LATEST)
 
@@ -158,10 +162,34 @@ async def eval_with_retries(
                 raise
             await asyncio.sleep(backoff * attempt)
 
+########## FAN-OUT TO ALL ISLAND CONTROLLERS ##################
+async def fan_out(job_id: str, cfg: Dict):
+    # Discover all controller pod IPs via the headless service
+    infos = socket.getaddrinfo(
+        CONTROLLER_HEADLESS, CONTROLLER_PORT, proto=socket.IPPROTO_TCP
+    )
+    hosts = sorted({f"{addr[4][0]}:{CONTROLLER_PORT}" for addr in infos})
+    logger.info(f"Dispatching Job {job_id} to islands: {hosts}")
+
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        tasks = [
+            client.post(
+                f"http://{host}/execute",
+                json={"job_id": job_id, **cfg}
+            )
+            for host in hosts
+        ]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        for host, res in zip(hosts, results):
+            if isinstance(res, Exception):
+                logger.error(f"Island {host} fan-out FAILED: {res}")
+            else:
+                logger.info(f"Island {host} fan-out OK: {res.status_code}")
+
 ########### API ENDPOINTS ######################################
 @app.post("/run", response_model=RunResponse)
-async def start_run(req: RunRequest, bg: BackgroundTasks):
-    job_id = str(uuid.uuid4())
+async def start_run(req: RunRequest):
+    job_id   = str(uuid.uuid4())
     redis_key = f"job:{job_id}"
     # initialize status in Redis
     rdb.hset(redis_key, mapping={
@@ -170,44 +198,16 @@ async def start_run(req: RunRequest, bg: BackgroundTasks):
         "best":       ""
     })
 
-    # background GA for this pod
-    bg.add_task(run_ga, job_id, req.dict())
+    # 1) run GA locally on this pod
+    asyncio.create_task(run_ga(job_id, req.dict()))
 
-    # fan-out to all islands
-    async def fan_out():
-        async with httpx.AsyncClient() as client:
-            tasks = []
-            for i in range(req.num_islands):
-                host = (
-                    f"ga-controller-{i}"
-                    f".ga-controller-headless.default.svc.cluster.local:8000"
-                )
-                url = f"http://{host}/execute"
-                tasks.append(
-                    client.post(
-                        url,
-                        json={"job_id": job_id, **req.dict()},
-                        timeout=5.0
-                    )
-                )
-    
-            # fire off all calls at once
-            results = await asyncio.gather(*tasks, return_exceptions=True)
-    
-            # log success or failure per island
-            for idx, res in enumerate(results):
-                if isinstance(res, Exception):
-                    logger.error(f"Island {idx} fan-out FAILED: {res}")
-                else:
-                    logger.info(f"Island {idx} fan-out OK: {res.status_code}")
-    
-    # schedule the fan-out
-    bg.add_task(fan_out)
+    # 2) fan-out to all islands
+    asyncio.create_task(fan_out(job_id, req.dict()))
+
     return RunResponse(job_id=job_id)
 
 @app.post("/execute")
 async def execute_island(req: ExecuteRequest):
-    # each island runs its own GA loop
     await run_ga(req.job_id, req.dict(exclude={"job_id"}))
     return {"status": "accepted", "pod": POD}
 
@@ -251,6 +251,7 @@ def result(job_id: str):
         response.update(full_result)
 
     return response
+
 ########## GA UTILITIES #######################################
 def init_population(pop_size: int, num_tasks: int,
                     num_cores: int, rng: random.Random
@@ -422,16 +423,16 @@ async def run_ga(job_id: str, cfg: Dict):
     
     # build final result (include best individual)
     final = {
-    "job_id":          job_id,
-    "best_fitness":    prev_best,
-    "best_individual": best_individual,
-    "core_times":      compute_core_times(best_individual, exec_times, cfg["num_cores"]),
-    "GA_runtime":      time.time() - start,
-    "metrics": {
-        "generations_executed": gen,
-        "total_duration_s": sum(sample.value for sample in gen_duration.collect())
-    },
-    "status":          "stagnated" if stagnated else "done"
+        "job_id":          job_id,
+        "best_fitness":    prev_best,
+        "best_individual": best_individual,
+        "core_times":      compute_core_times(best_individual, exec_times, cfg["num_cores"]),
+        "GA_runtime":      time.time() - start,
+        "metrics": {
+            "generations_executed": gen,
+            "total_duration_s": sum(sample.value for sample in gen_duration.collect())
+        },
+        "status":          "stagnated" if stagnated else "done"
     }
     blob_client = blob_service.get_blob_client(container=blob_container, blob=f"{job_id}.txt")
     blob_client.upload_blob(json.dumps(final), overwrite=True)
