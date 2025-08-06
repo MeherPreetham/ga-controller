@@ -175,35 +175,35 @@ async def start_run(req: RunRequest, bg: BackgroundTasks):
 
     # fan-out to all islands
     async def fan_out():
-    async with httpx.AsyncClient() as client:
-        tasks = []
-        for i in range(req.num_islands):
-            host = (
-                f"ga-controller-{i}"
-                f".ga-controller-headless.default.svc.cluster.local:8000"
-            )
-            url = f"http://{host}/execute"
-            tasks.append(
-                client.post(
-                    url,
-                    json={"job_id": job_id, **req.dict()},
-                    timeout=5.0
+        async with httpx.AsyncClient() as client:
+            tasks = []
+            for i in range(req.num_islands):
+                host = (
+                    f"ga-controller-{i}"
+                    f".ga-controller-headless.default.svc.cluster.local:8000"
                 )
-            )
-
-        # fire off all calls at once
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-
-        # log success or failure per island
-        for idx, res in enumerate(results):
-            if isinstance(res, Exception):
-                logger.error(f"Island {idx} fan-out FAILED: {res}")
-            else:
-                logger.info(f"Island {idx} fan-out OK: {res.status_code}")
-
-# schedule the fan-out
-bg.add_task(fan_out)
-return RunResponse(job_id=job_id)
+                url = f"http://{host}/execute"
+                tasks.append(
+                    client.post(
+                        url,
+                        json={"job_id": job_id, **req.dict()},
+                        timeout=5.0
+                    )
+                )
+    
+            # fire off all calls at once
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+    
+            # log success or failure per island
+            for idx, res in enumerate(results):
+                if isinstance(res, Exception):
+                    logger.error(f"Island {idx} fan-out FAILED: {res}")
+                else:
+                    logger.info(f"Island {idx} fan-out OK: {res.status_code}")
+    
+    # schedule the fan-out
+    bg.add_task(fan_out)
+    return RunResponse(job_id=job_id)
 
 @app.post("/execute")
 async def execute_island(req: ExecuteRequest):
