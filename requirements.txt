@@ -5,3 +5,4 @@ httpx==0.24.1
 redis==4.5.5
 prometheus-client==0.16.0
 azure-storage-blob==12.20.0
+matplotlib
