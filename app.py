@@ -69,7 +69,7 @@ class RunRequest(BaseModel):
     base_energy:        float = Field(..., gt=0)
     idle_energy:        float = Field(..., ge=0)
     seed:               Optional[int] = None
-    stagnation_limit:   Optional[int] = Field(None, gt=1)
+    stagnation_limit:   Optional[int] = Field(None, ge=0, description="0 disables early stop; otherwise stop after N gens w/o global improvement")
     case_label:         Optional[str] = None
 
 class RunResponse(BaseModel):
@@ -77,6 +77,19 @@ class RunResponse(BaseModel):
 
 class ExecuteRequest(RunRequest):
     job_id: str = Field(..., description="Job to execute on this island")
+
+########## HELPERS #############################################
+def migrants_key(job_id: str) -> str:
+    return f"ga:{job_id}:migrants"
+
+def is_leader(job_id: str) -> bool:
+    return rdb.get(f"job:{job_id}:leader") == POD
+
+def get_stop_flag(job_id: str) -> bool:
+    return rdb.get(f"job:{job_id}:stop") == "1"
+
+def set_stop_flag(job_id: str):
+    rdb.set(f"job:{job_id}:stop", "1")
 
 ########## EVALUATOR HELPER ####################################
 async def eval_with_retries(
@@ -172,10 +185,11 @@ def compute_raw_metrics(individual: List[int], exec_times: List[float], num_core
     imbalance = pstdev(cores) / (mean_load if mean_load != 0 else 1e-9)
     return cores, makespan, total_e, imbalance
 
-########## ATOMIC GLOBAL-BEST UPDATE ###########################
-def try_update_global_best(job_id: str, cand_best: float, cand_individual: List[int]) -> Tuple[bool, float]:
+########## GLOBAL-BEST UPDATE ###########################
+def try_update_global_best(job_id: str, cand_best: float, cand_individual: List[int], gen: int) -> Tuple[bool, float]:
     """
     Atomically update Redis global best if cand_best is strictly better.
+    Also updates last_improve_gen.
     Returns (updated, new_global_best).
     """
     key = f"job:{job_id}"
@@ -188,16 +202,16 @@ def try_update_global_best(job_id: str, cand_best: float, cand_individual: List[
             if cand_best >= curr:
                 pipe.unwatch()
                 return False, curr
-            # update global best & individual atomically
+            # update global best, individual, and last improvement generation atomically
             pipe.multi()
             pipe.hset(key, mapping={
-                "best":       str(cand_best),
-                "individual": json.dumps(cand_individual)
+                "best":               str(cand_best),
+                "individual":         json.dumps(cand_individual),
+                "last_improve_gen":   str(gen)
             })
             pipe.execute()
             return True, cand_best
         except redis.WatchError:
-            # race; retry
             continue
         finally:
             try:
@@ -211,18 +225,25 @@ async def start_run(req: RunRequest):
     if not AZ_CONN_STR or not AZ_CONTAINER:
         raise HTTPException(status_code=500, detail="Missing AZURE_STORAGE_CONNECTION_STRING or BLOB_CONTAINER")
 
-    job_id   = str(uuid.uuid4())
+    job_id    = str(uuid.uuid4())
     redis_key = f"job:{job_id}"
 
-    # initialize basic status in Redis
+    # Elect a leader (first pod to create job)
+    rdb.setnx(f"{redis_key}:leader", POD)
+
+    # initialize job keys
     rdb.hset(redis_key, mapping={
         "status": "running",
         "generation": "0",
-        "best": "",          # global best (float, as string)
-        "individual": ""     # global best individual
+        "best": "",                # global best
+        "individual": "",          # global best individual
+        "last_improve_gen": "0"
     })
+    rdb.set(f"{redis_key}:stop", "0")  # global stop flag
+    rdb.delete(migrants_key(job_id))   # clear job-scoped migrant list
 
     cfg = req.dict()
+
     # 1) run GA on this pod
     asyncio.create_task(run_ga(job_id, cfg))
     # 2) fan-out to islands
@@ -230,13 +251,12 @@ async def start_run(req: RunRequest):
 
     return RunResponse(job_id=job_id)
 
-########## BACK-COMPAT (island entry) ##########################
 @app.post("/execute")
 async def execute_island(req: ExecuteRequest):
     await run_ga(req.job_id, req.dict(exclude={"job_id"}))
     return {"status": "accepted", "pod": POD}
 
-########## API: STATUS (monolithic-style) ######################
+########## API: STATUS ######################
 @app.get("/status/{job_id}")
 def status(job_id: str):
     key = f"job:{job_id}"
@@ -250,12 +270,7 @@ def status(job_id: str):
         "best_individual": json.loads(data.get("individual", "[]")) if data.get("individual") else None
     }
 
-# keep old paths working
-@app.get("/run/{job_id}/status")
-def status_compat(job_id: str):
-    return status(job_id)
-
-########## API: RESULT (monolithic-style) ######################
+########## API: RESULT ######################
 @app.get("/result/{job_id}")
 def result(job_id: str):
     key = f"job:{job_id}"
@@ -275,19 +290,13 @@ def result(job_id: str):
         logger.error(f"Failed to read final result from blob: {e}")
         raise HTTPException(500, "Failed to read final result from blob")
 
-# keep old path working
-@app.get("/run/{job_id}/result")
-def result_compat(job_id: str):
-    return result(job_id)
-
 ########## MAIN GA LOOP (island) ###############################
-MIGRATION_KEY = "ga:migrants"
-
 async def run_ga(job_id: str, cfg: Dict):
     key = f"job:{job_id}"
-    stagnated = False
+    mkey = migrants_key(job_id)
+    stagnated_local = False  # island-local stagnation
 
-    # Azure blob client (lazy)
+    # Azure blob client
     svc = BlobServiceClient.from_connection_string(AZ_CONN_STR)
     try:
         svc.create_container(AZ_CONTAINER)
@@ -298,7 +307,7 @@ async def run_ga(job_id: str, cfg: Dict):
     base_seed = int(cfg.get("seed") or 0)
     rng_exec  = random.Random(base_seed)
     exec_times = [rng_exec.randint(10, 20) for _ in range(cfg["num_tasks"])]
-    logger.info(f"Job {job_id}: exec_times head={exec_times[:5]}")
+    logger.info(f"Job {job_id} ({POD}): exec_times head={exec_times[:5]}")
 
     # Island RNG (so each island differs deterministically)
     pod_name  = os.getenv("POD_NAME", "ga-island-0")
@@ -313,11 +322,11 @@ async def run_ga(job_id: str, cfg: Dict):
     avg_per_gen:  List[float] = []
     std_per_gen:  List[float] = []
 
-    # Island-local best (for stagnation/migration decisions)
+    # Island-local best (for migration decisions)
     local_best: float = float('inf')
     local_best_ind: Optional[List[int]] = None
 
-    no_improve = 0
+    no_improve_local = 0
     stagnation_lim = int(cfg.get("stagnation_limit") or 0)
     interval = cfg["migration_interval"]
     num_islands = cfg["num_islands"]
@@ -326,6 +335,11 @@ async def run_ga(job_id: str, cfg: Dict):
     gen_executed = 0
 
     for gen in range(1, cfg["generations"] + 1):
+        # Early stop if leader set global stop
+        if get_stop_flag(job_id):
+            logger.info(f"Job {job_id} ({POD}): observed global stop at gen={gen}")
+            break
+
         # Evaluate population in parallel via evaluator service
         async with httpx.AsyncClient() as client:
             tasks = [
@@ -352,33 +366,46 @@ async def run_ga(job_id: str, cfg: Dict):
         # Progress: update generation only (do NOT overwrite global best here)
         rdb.hset(key, mapping={"generation": str(gen)})
 
-        # If island improved locally, consider updating GLOBAL best atomically
+        # If island improved locally, attempt atomic GLOBAL best update
         if best < local_best:
             idx            = fitnesses.index(best)
             local_best_ind = population[idx]
             local_best     = best
-            # Attempt atomic global-best update
-            updated, new_gbest = try_update_global_best(job_id, local_best, local_best_ind)
+
+            # Attempt atomic global-best update (also records last_improve_gen)
+            updated, new_gbest = try_update_global_best(job_id, local_best, local_best_ind, gen)
             if updated:
-                # Optionally publish migrant when we improved the global best
-                rdb.lpush(MIGRATION_KEY, json.dumps(local_best_ind))
-                rdb.ltrim(MIGRATION_KEY, 0, num_islands - 1)
-                no_improve = 0
+                # publish migrant ONLY when we improved the global best
+                rdb.lpush(mkey, json.dumps(local_best_ind))
+                rdb.ltrim(mkey, 0, num_islands - 1)
+                no_improve_local = 0
             else:
-                # No global improvement; keep stagnation accounting local
-                no_improve += 0  # effectively no reset
+                # No global improvement; keep local stagnation accounting
+                # (no reset)
+                pass
         else:
-            # Local stagnation handling
+            # Local stagnation handling (optional)
             if stagnation_lim > 0:
-                no_improve += 1
-                if no_improve >= stagnation_lim:
-                    stagnated = True
-                    logger.info(f"Job {job_id}: stagnated at gen={gen} (island={island_id})")
+                no_improve_local += 1
+                if no_improve_local >= stagnation_lim:
+                    stagnated_local = True
+                    logger.info(f"Job {job_id} ({POD}): local stagnation at gen={gen} (limit={stagnation_lim})")
+                    # Do NOT set job status; leader decides global stop
                     break
+
+        # Leader-only: decide global early stop based on GLOBAL last_improve_gen
+        if stagnation_lim > 0 and is_leader(job_id):
+            try:
+                last_improve = int(rdb.hget(key, "last_improve_gen") or "0")
+            except Exception:
+                last_improve = 0
+            if gen - last_improve >= stagnation_lim:
+                logger.info(f"Job {job_id} (leader {POD}): global stagnation detected at gen={gen} (last_improve_gen={last_improve}, limit={stagnation_lim})")
+                set_stop_flag(job_id)
 
         # Migration (use current migrants list if any)
         if gen % interval == 0:
-            migrants_raw = rdb.lrange(MIGRATION_KEY, 0, num_islands - 1)
+            migrants_raw = rdb.lrange(mkey, 0, num_islands - 1)
             migrants     = [json.loads(m) for m in migrants_raw] if migrants_raw else []
             if migrants:
                 async with httpx.AsyncClient() as client:
@@ -400,75 +427,87 @@ async def run_ga(job_id: str, cfg: Dict):
                     if i < len(pairs):
                         pairs[i] = (migrants[i], fit)
                 population = [ind for ind, _ in pairs]
-                rdb.delete(MIGRATION_KEY)
+                rdb.delete(mkey)
 
         # Next generation
         population = next_generation(population, fitnesses, cfg)
 
     elapsed_all = time.time() - start_all
 
-    # Read the FINAL GLOBAL best from Redis (single source of truth)
-    gbest_str = rdb.hget(key, "best")
-    gbest = float(gbest_str) if gbest_str else (best_per_gen[-1] if best_per_gen else float("inf"))
-    gind_json = rdb.hget(key, "individual")
-    gind = json.loads(gind_json) if gind_json else (local_best_ind or (population[0] if population else []))
+    # Leader compiles final output & uploads blob; others just exit
+    if is_leader(job_id):
+        # Read the FINAL GLOBAL best from Redis (single source of truth)
+        gbest_str = rdb.hget(key, "best")
+        gbest = float(gbest_str) if gbest_str else (best_per_gen[-1] if best_per_gen else float("inf"))
+        gind_json = rdb.hget(key, "individual")
+        gind = json.loads(gind_json) if gind_json else (local_best_ind or (population[0] if population else []))
 
-    # Compute raw metrics for the GLOBAL best individual
-    cores, mk, te, imb = compute_raw_metrics(gind, exec_times, cfg["num_cores"],
-                                             cfg["base_energy"], cfg["idle_energy"])
+        # Compute raw metrics for the GLOBAL best individual
+        cores, mk, te, imb = compute_raw_metrics(gind, exec_times, cfg["num_cores"],
+                                                 cfg["base_energy"], cfg["idle_energy"])
 
-    # Build final JSON in SAME SHAPE as monolithic GA
-    final = {
-        "run_id":               job_id,
-        "case_label":           cfg.get("case_label"),
-        "num_tasks":            cfg["num_tasks"],
-        "num_cores":            cfg["num_cores"],
-        "num_population":       cfg["population"],
-        "num_generations":      cfg["generations"],
-        "crossover_rate":       cfg["crossover_rate"],
-        "mutation_rate":        cfg["mutation_rate"],
-        "base_energy":          cfg["base_energy"],
-        "idle_energy":          cfg["idle_energy"],
-        "stagnation_limit":     cfg.get("stagnation_limit"),
-        "seed":                 cfg.get("seed"),
-        "generations_executed": len(best_per_gen),
-        "elapsed_time_s":       elapsed_all,
-        "best_individual":      gind,
-        "best_fitness":         gbest,
-        "best_per_generation":  best_per_gen,
-        "avg_per_generation":   avg_per_gen,
-        "std_per_generation":   std_per_gen,
-        "makespan":             mk,
-        "total_energy":         te,
-        "imbalance":            imb,
-        "core_times":           cores
-    }
+        # Build final JSON in SAME SHAPE as monolithic GA
+        final = {
+            "run_id":               job_id,
+            "case_label":           cfg.get("case_label"),
+            "num_tasks":            cfg["num_tasks"],
+            "num_cores":            cfg["num_cores"],
+            "num_population":       cfg["population"],
+            "num_generations":      cfg["generations"],
+            "crossover_rate":       cfg["crossover_rate"],
+            "mutation_rate":        cfg["mutation_rate"],
+            "base_energy":          cfg["base_energy"],
+            "idle_energy":          cfg["idle_energy"],
+            "stagnation_limit":     cfg.get("stagnation_limit"),
+            "seed":                 cfg.get("seed"),
+            "generations_executed": len(best_per_gen),
+            "elapsed_time_s":       elapsed_all,
+            "best_individual":      gind,
+            "best_fitness":         gbest,
+            "best_per_generation":  best_per_gen,
+            "avg_per_generation":   avg_per_gen,
+            "std_per_generation":   std_per_gen,
+            "makespan":             mk,
+            "total_energy":         te,
+            "imbalance":            imb,
+            "core_times":           cores
+        }
 
-    # Upload JSON + plot to blob
-    try:
-        txt_blob = svc.get_blob_client(container=AZ_CONTAINER, blob=f"{job_id}.txt")
-        txt_blob.upload_blob(json.dumps(final), overwrite=True)
+        # Upload JSON + plot to blob
+        try:
+            txt_blob = svc.get_blob_client(container=AZ_CONTAINER, blob=f"{job_id}.txt")
+            txt_blob.upload_blob(json.dumps(final), overwrite=True)
 
-        plt.figure()
-        plt.plot(final["best_per_generation"], label="Best")
-        plt.plot(final["avg_per_generation"],  label="Average")
-        plt.xlabel("Generation")
-        plt.ylabel("Fitness")
-        plt.legend()
-        plt.tight_layout()
-        buf = io.BytesIO()
-        plt.savefig(buf, format="png", dpi=150)
-        plt.close()
-        buf.seek(0)
-        png_blob = svc.get_blob_client(container=AZ_CONTAINER, blob=f"{job_id}.png")
-        png_blob.upload_blob(buf.read(), overwrite=True)
-    except Exception as e:
-        logger.error(f"Blob upload failed for job {job_id}: {e}")
+            plt.figure()
+            plt.plot(final["best_per_generation"], label="Best")
+            plt.plot(final["avg_per_generation"],  label="Average")
+            plt.xlabel("Generation")
+            plt.ylabel("Fitness")
+            plt.legend()
+            plt.tight_layout()
+            buf = io.BytesIO()
+            plt.savefig(buf, format="png", dpi=150)
+            plt.close()
+            buf.seek(0)
+            png_blob = svc.get_blob_client(container=AZ_CONTAINER, blob=f"{job_id}.png")
+            png_blob.upload_blob(buf.read(), overwrite=True)
+        except Exception as e:
+            logger.error(f"Blob upload failed for job {job_id}: {e}")
 
-    # Mark done (do not overwrite best/individual here)
-    rdb.hset(key, mapping={
-        "status": "stagnated" if stagnated else "done",
-        "generation": str(gen_executed)
-    })
-    rdb.delete(MIGRATION_KEY)
-    logger.info(f"Job {job_id}: complete → status={'stagnated' if stagnated else 'done'}")
+        # Decide final status
+        stopped_globally = get_stop_flag(job_id)
+        final_status = "stagnated" if stopped_globally else "done"
+
+        # Mark done by leader (single writer of final status)
+        rdb.hset(key, mapping={
+            "status": final_status,
+            "generation": str(gen_executed)
+        })
+
+        # Cleanup job-scoped migrants and stop flag
+        rdb.delete(migrants_key(job_id))
+        rdb.delete(f"job:{job_id}:stop")
+
+        logger.info(f"Job {job_id}: finalized by leader {POD} → status={final_status}")
+    else:
+        logger.info(f"Job {job_id}: island {POD} finished (leader will finalize)")
