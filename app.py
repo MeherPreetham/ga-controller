@@ -9,7 +9,7 @@ import socket
 import random
 import io
 
-from typing import List, Optional, Dict
+from typing import List, Optional, Dict, Tuple
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 import httpx
@@ -58,7 +58,6 @@ def healthz():
 
 ########## MODELS ##############################################
 class RunRequest(BaseModel):
-    # GA config (keep existing names for controller, add optional case_label)
     num_tasks:          int   = Field(..., gt=0)
     num_cores:          int   = Field(..., gt=0)
     population:         int   = Field(..., gt=1)
@@ -173,21 +172,54 @@ def compute_raw_metrics(individual: List[int], exec_times: List[float], num_core
     imbalance = pstdev(cores) / (mean_load if mean_load != 0 else 1e-9)
     return cores, makespan, total_e, imbalance
 
+########## ATOMIC GLOBAL-BEST UPDATE ###########################
+def try_update_global_best(job_id: str, cand_best: float, cand_individual: List[int]) -> Tuple[bool, float]:
+    """
+    Atomically update Redis global best if cand_best is strictly better.
+    Returns (updated, new_global_best).
+    """
+    key = f"job:{job_id}"
+    pipe = rdb.pipeline()
+    while True:
+        try:
+            pipe.watch(key)
+            curr_str = pipe.hget(key, "best")
+            curr = float(curr_str) if curr_str else float("inf")
+            if cand_best >= curr:
+                pipe.unwatch()
+                return False, curr
+            # update global best & individual atomically
+            pipe.multi()
+            pipe.hset(key, mapping={
+                "best":       str(cand_best),
+                "individual": json.dumps(cand_individual)
+            })
+            pipe.execute()
+            return True, cand_best
+        except redis.WatchError:
+            # race; retry
+            continue
+        finally:
+            try:
+                pipe.reset()
+            except Exception:
+                pass
+
 ########## API: START RUN ######################################
 @app.post("/run", response_model=RunResponse)
 async def start_run(req: RunRequest):
     if not AZ_CONN_STR or not AZ_CONTAINER:
         raise HTTPException(status_code=500, detail="Missing AZURE_STORAGE_CONNECTION_STRING or BLOB_CONTAINER")
 
-    job_id = str(uuid.uuid4())
+    job_id   = str(uuid.uuid4())
     redis_key = f"job:{job_id}"
 
     # initialize basic status in Redis
     rdb.hset(redis_key, mapping={
         "status": "running",
         "generation": "0",
-        "best": "",
-        "individual": ""
+        "best": "",          # global best (float, as string)
+        "individual": ""     # global best individual
     })
 
     cfg = req.dict()
@@ -212,9 +244,9 @@ def status(job_id: str):
         raise HTTPException(404, "Job not found")
     data = rdb.hgetall(key)
     return {
-        "status":        data.get("status"),
-        "generation":    int(data.get("generation", 0)),
-        "best_fitness":  float(data["best"]) if data.get("best") else None,
+        "status":          data.get("status"),
+        "generation":      int(data.get("generation", 0)),
+        "best_fitness":    float(data["best"]) if data.get("best") else None,
         "best_individual": json.loads(data.get("individual", "[]")) if data.get("individual") else None
     }
 
@@ -276,13 +308,15 @@ async def run_ga(job_id: str, cfg: Dict):
     # Initialize population
     population = init_population(cfg["population"], cfg["num_tasks"], cfg["num_cores"], rng_pop)
 
-    # Per-generation stats
+    # Per-generation stats (local, for plotting)
     best_per_gen: List[float] = []
     avg_per_gen:  List[float] = []
     std_per_gen:  List[float] = []
 
-    prev_best: float = float('inf')
-    best_individual: Optional[List[int]] = None
+    # Island-local best (for stagnation/migration decisions)
+    local_best: float = float('inf')
+    local_best_ind: Optional[List[int]] = None
+
     no_improve = 0
     stagnation_lim = int(cfg.get("stagnation_limit") or 0)
     interval = cfg["migration_interval"]
@@ -315,35 +349,34 @@ async def run_ga(job_id: str, cfg: Dict):
         std_per_gen.append(stdv)
         gen_executed = gen
 
-        # Update Redis progress with *current* best (even if not global-best)
-        rdb.hset(key, mapping={
-            "generation": str(gen),
-            "best":       str(best if prev_best == float('inf') else min(prev_best, best)),
-            "individual": json.dumps(best_individual or [])
-        })
+        # Progress: update generation only (do NOT overwrite global best here)
+        rdb.hset(key, mapping={"generation": str(gen)})
 
-        # Update global best + stagnation
-        if best < prev_best:
-            idx             = fitnesses.index(best)
-            best_individual = population[idx]
-            prev_best       = best
-            no_improve      = 0
-            rdb.hset(key, mapping={
-                "best":       str(prev_best),
-                "individual": json.dumps(best_individual)
-            })
-            # publish migrant
-            rdb.lpush(MIGRATION_KEY, json.dumps(best_individual))
-            rdb.ltrim(MIGRATION_KEY, 0, num_islands - 1)
+        # If island improved locally, consider updating GLOBAL best atomically
+        if best < local_best:
+            idx            = fitnesses.index(best)
+            local_best_ind = population[idx]
+            local_best     = best
+            # Attempt atomic global-best update
+            updated, new_gbest = try_update_global_best(job_id, local_best, local_best_ind)
+            if updated:
+                # Optionally publish migrant when we improved the global best
+                rdb.lpush(MIGRATION_KEY, json.dumps(local_best_ind))
+                rdb.ltrim(MIGRATION_KEY, 0, num_islands - 1)
+                no_improve = 0
+            else:
+                # No global improvement; keep stagnation accounting local
+                no_improve += 0  # effectively no reset
         else:
+            # Local stagnation handling
             if stagnation_lim > 0:
                 no_improve += 1
                 if no_improve >= stagnation_lim:
                     stagnated = True
-                    logger.info(f"Job {job_id}: stagnated at gen={gen}")
+                    logger.info(f"Job {job_id}: stagnated at gen={gen} (island={island_id})")
                     break
 
-        # Migration
+        # Migration (use current migrants list if any)
         if gen % interval == 0:
             migrants_raw = rdb.lrange(MIGRATION_KEY, 0, num_islands - 1)
             migrants     = [json.loads(m) for m in migrants_raw] if migrants_raw else []
@@ -372,26 +405,22 @@ async def run_ga(job_id: str, cfg: Dict):
         # Next generation
         population = next_generation(population, fitnesses, cfg)
 
-    # Ensure we have a best individual
-    if best_individual is None:
-        # fall back to the first individual if nothing improved (edge case)
-        best_individual = population[0]
-        cores, mk, te, imb = compute_raw_metrics(best_individual, exec_times, cfg["num_cores"],
-                                                 cfg["base_energy"], cfg["idle_energy"])
-        prev_best = best_per_gen[-1] if best_per_gen else float('inf')
-    else:
-        cores, mk, te, imb = compute_raw_metrics(best_individual, exec_times, cfg["num_cores"],
-                                                 cfg["base_energy"], cfg["idle_energy"])
-
     elapsed_all = time.time() - start_all
 
-    # Build final JSON in the SAME SHAPE as monolithic GA
+    # Read the FINAL GLOBAL best from Redis (single source of truth)
+    gbest_str = rdb.hget(key, "best")
+    gbest = float(gbest_str) if gbest_str else (best_per_gen[-1] if best_per_gen else float("inf"))
+    gind_json = rdb.hget(key, "individual")
+    gind = json.loads(gind_json) if gind_json else (local_best_ind or (population[0] if population else []))
+
+    # Compute raw metrics for the GLOBAL best individual
+    cores, mk, te, imb = compute_raw_metrics(gind, exec_times, cfg["num_cores"],
+                                             cfg["base_energy"], cfg["idle_energy"])
+
+    # Build final JSON in SAME SHAPE as monolithic GA
     final = {
-        # identity / labeling
         "run_id":               job_id,
         "case_label":           cfg.get("case_label"),
-
-        # config snapshot (use monolithic key names for parity)
         "num_tasks":            cfg["num_tasks"],
         "num_cores":            cfg["num_cores"],
         "num_population":       cfg["population"],
@@ -402,17 +431,13 @@ async def run_ga(job_id: str, cfg: Dict):
         "idle_energy":          cfg["idle_energy"],
         "stagnation_limit":     cfg.get("stagnation_limit"),
         "seed":                 cfg.get("seed"),
-
-        # outcomes
         "generations_executed": len(best_per_gen),
         "elapsed_time_s":       elapsed_all,
-        "best_individual":      best_individual,
-        "best_fitness":         prev_best,
+        "best_individual":      gind,
+        "best_fitness":         gbest,
         "best_per_generation":  best_per_gen,
         "avg_per_generation":   avg_per_gen,
         "std_per_generation":   std_per_gen,
-
-        # raw metrics of final best
         "makespan":             mk,
         "total_energy":         te,
         "imbalance":            imb,
@@ -424,7 +449,6 @@ async def run_ga(job_id: str, cfg: Dict):
         txt_blob = svc.get_blob_client(container=AZ_CONTAINER, blob=f"{job_id}.txt")
         txt_blob.upload_blob(json.dumps(final), overwrite=True)
 
-        # Plot and upload PNG
         plt.figure()
         plt.plot(final["best_per_generation"], label="Best")
         plt.plot(final["avg_per_generation"],  label="Average")
@@ -441,12 +465,10 @@ async def run_ga(job_id: str, cfg: Dict):
     except Exception as e:
         logger.error(f"Blob upload failed for job {job_id}: {e}")
 
-    # Mark done in Redis
+    # Mark done (do not overwrite best/individual here)
     rdb.hset(key, mapping={
         "status": "stagnated" if stagnated else "done",
-        "generation": str(gen_executed),
-        "best": str(prev_best),
-        "individual": json.dumps(best_individual or [])
+        "generation": str(gen_executed)
     })
     rdb.delete(MIGRATION_KEY)
     logger.info(f"Job {job_id}: complete → status={'stagnated' if stagnated else 'done'}")
