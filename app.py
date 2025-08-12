@@ -8,6 +8,7 @@ import asyncio
 import socket
 import random
 import io
+import math
 
 from typing import List, Optional, Dict, Tuple
 from fastapi import FastAPI, HTTPException
@@ -405,9 +406,15 @@ async def run_ga(job_id: str, cfg: Dict):
                     tasks = [safe_eval(indiv) for indiv in population]
                     fitnesses = await asyncio.gather(*tasks)
 
-                best = min(fitnesses)
-                avgv = mean(fitnesses)
-                stdv = pstdev(fitnesses) if len(fitnesses) > 1 else 0.0
+                finite = [f for f in fitnesses if math.isfinite(f)]
+                if finite:
+                    best = min(finite)
+                    avgv = mean(finite)
+                    stdv = pstdev(finite) if len(finite) > 1 else 0.0
+                else:
+                    best = float("inf")
+                    avgv = float("inf")
+                    stdv = 0.0
 
                 best_per_gen.append(best)
                 avg_per_gen.append(avgv)
@@ -417,7 +424,7 @@ async def run_ga(job_id: str, cfg: Dict):
                 r_hset(key, {"generation": str(gen)})
 
                 if best < local_best:
-                    idx            = fitnesses.index(best)
+                    idx            = fitnesses.index(best) if best in fitnesses else min(range(len(fitnesses)), key=lambda i: fitnesses[i])
                     local_best_ind = population[idx]
                     local_best     = best
 
