@@ -300,6 +300,26 @@ def status(job_id: str):
         "best_fitness":    float(data["best"]) if data.get("best") else None
     }
 
+########## API: STOP ########################
+@app.post("/stop/{job_id}")
+def stop_job(job_id: str):
+    key = f"job:{job_id}"
+    if not rdb.exists(key):
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    # Set the global stop flag (respects REDIS_DB)
+    set_stop_flag(job_id)
+
+    # Optionally reflect intent in status so /status shows progress
+    try:
+        curr = rdb.hget(key, "status")
+        if curr == "running":
+            r_hset(key, {"status": "stopping"})
+    except Exception:
+        pass
+
+    return {"job_id": job_id, "stopping": True}
+
 ########## API: RESULT ######################
 @app.get("/result/{job_id}")
 def result(job_id: str):
