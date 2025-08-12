@@ -334,119 +334,131 @@ async def run_ga(job_id: str, cfg: Dict):
     start_all = time.time()
     gen_executed = 0
 
-    for gen in range(1, cfg["generations"] + 1):
-        # Early stop if leader set global stop
-        if get_stop_flag(job_id):
-            logger.info(f"Job {job_id} ({POD}): observed global stop at gen={gen}")
-            break
+    # HTTP client + concurrency limits
+    MAX_CONC = int(os.getenv("EVAL_CONCURRENCY", "24"))
+    limits = httpx.Limits(max_connections=64, max_keepalive_connections=32)
 
-        # Evaluate population in parallel via evaluator service
-        async with httpx.AsyncClient() as client:
-            tasks = [
-                eval_with_retries(client, {
-                    "individual":      indiv,
-                    "execution_times": exec_times,
-                    "base_energy":     cfg["base_energy"],
-                    "idle_energy":     cfg["idle_energy"],
-                })
-                for indiv in population
-            ]
-            fitnesses = await asyncio.gather(*tasks)
+    try:
+        for gen in range(1, cfg["generations"] + 1):
+            # Early stop if leader set global stop
+            if get_stop_flag(job_id):
+                logger.info(f"Job {job_id} ({POD}): observed global stop at gen={gen}")
+                break
 
-        # Per-gen stats
-        best = min(fitnesses)
-        avgv = mean(fitnesses)
-        stdv = pstdev(fitnesses) if len(fitnesses) > 1 else 0.0
+            sem = asyncio.Semaphore(MAX_CONC)
+            async with httpx.AsyncClient(timeout=30.0, limits=limits) as client:
+                async def safe_eval(indiv):
+                    async with sem:
+                        try:
+                            return await eval_with_retries(client, {
+                                "individual":      indiv,
+                                "execution_times": exec_times,
+                                "base_energy":     cfg["base_energy"],
+                                "idle_energy":     cfg["idle_energy"],
+                            })
+                        except Exception as e:
+                            logger.error(f"Job {job_id} ({POD}) gen={gen}: evaluator failed: {e}")
+                            return float("inf")
 
-        best_per_gen.append(best)
-        avg_per_gen.append(avgv)
-        std_per_gen.append(stdv)
-        gen_executed = gen
+                # Evaluate population
+                tasks = [safe_eval(indiv) for indiv in population]
+                fitnesses = await asyncio.gather(*tasks)
 
-        # Progress: update generation only (do NOT overwrite global best here)
-        rdb.hset(key, mapping={"generation": str(gen)})
+            # Per-gen stats
+            best = min(fitnesses)
+            avgv = mean(fitnesses)
+            stdv = pstdev(fitnesses) if len(fitnesses) > 1 else 0.0
 
-        # If island improved locally, attempt atomic GLOBAL best update
-        if best < local_best:
-            idx            = fitnesses.index(best)
-            local_best_ind = population[idx]
-            local_best     = best
+            best_per_gen.append(best)
+            avg_per_gen.append(avgv)
+            std_per_gen.append(stdv)
+            gen_executed = gen
 
-            # Attempt atomic global-best update (also records last_improve_gen)
-            updated, new_gbest = try_update_global_best(job_id, local_best, local_best_ind, gen)
-            if updated:
-                # publish migrant ONLY when we improved the global best
-                rdb.lpush(mkey, json.dumps(local_best_ind))
-                rdb.ltrim(mkey, 0, num_islands - 1)
+            # Progress: update generation only (do NOT overwrite global best here)
+            rdb.hset(key, mapping={"generation": str(gen)})
+
+            # If island improved locally, attempt atomic GLOBAL best update
+            if best < local_best:
+                idx            = fitnesses.index(best)
+                local_best_ind = population[idx]
+                local_best     = best
+
+                # Attempt atomic global-best update (also records last_improve_gen)
+                try_update_global_best(job_id, local_best, local_best_ind, gen)
+                # Reset local stagnation on local improvement (not only when global improves)
                 no_improve_local = 0
             else:
-                # No global improvement; keep local stagnation accounting
-                # (no reset)
-                pass
-        else:
-            # Local stagnation handling (optional)
-            if stagnation_lim > 0:
-                no_improve_local += 1
-                if no_improve_local >= stagnation_lim:
-                    stagnated_local = True
-                    logger.info(f"Job {job_id} ({POD}): local stagnation at gen={gen} (limit={stagnation_lim})")
-                    # Do NOT set job status; leader decides global stop
-                    break
+                # Local stagnation handling (optional)
+                if stagnation_lim > 0:
+                    no_improve_local += 1
+                    if no_improve_local >= stagnation_lim:
+                        stagnated_local = True
+                        logger.info(f"Job {job_id} ({POD}): local stagnation at gen={gen} (limit={stagnation_lim})")
+                        # Do NOT set job status; leader decides global stop
+                        break
 
-        # Leader-only: decide global early stop based on GLOBAL last_improve_gen
-        if stagnation_lim > 0 and is_leader(job_id):
-            try:
-                last_improve = int(rdb.hget(key, "last_improve_gen") or "0")
-            except Exception:
-                last_improve = 0
-            if gen - last_improve >= stagnation_lim:
-                logger.info(f"Job {job_id} (leader {POD}): global stagnation detected at gen={gen} (last_improve_gen={last_improve}, limit={stagnation_lim})")
-                set_stop_flag(job_id)
+            # Leader-only: decide global early stop based on GLOBAL last_improve_gen
+            if stagnation_lim > 0 and is_leader(job_id):
+                try:
+                    last_improve = int(rdb.hget(key, "last_improve_gen") or "0")
+                except Exception:
+                    last_improve = 0
+                if gen - last_improve >= stagnation_lim:
+                    logger.info(f"Job {job_id} (leader {POD}): global stagnation detected at gen={gen} (last_improve_gen={last_improve}, limit={stagnation_lim})")
+                    set_stop_flag(job_id)
 
-        # Migration (use current migrants list if any)
-        if gen % interval == 0:
-            migrants_raw = rdb.lrange(mkey, 0, num_islands - 1)
-            migrants     = [json.loads(m) for m in migrants_raw] if migrants_raw else []
-            if migrants:
-                async with httpx.AsyncClient() as client:
-                    tasks = [
-                        eval_with_retries(client, {
-                            "individual":      m,
-                            "execution_times": exec_times,
-                            "base_energy":     cfg["base_energy"],
-                            "idle_energy":     cfg["idle_energy"]
-                        })
-                        for m in migrants
-                    ]
-                    migrant_fits = await asyncio.gather(*tasks)
+            # Migration USING CURRENT MIGRANTS LIST
+                migrants_raw = rdb.lrange(mkey, 0, num_islands - 1)
+                migrants     = [json.loads(m) for m in migrants_raw] if migrants_raw else []
+                if migrants:
+                    sem_m = asyncio.Semaphore(MAX_CONC)
+                    async with httpx.AsyncClient(timeout=30.0, limits=limits) as client:
+                        async def safe_eval_mig(m):
+                            async with sem_m:
+                                try:
+                                    return await eval_with_retries(client, {
+                                        "individual":      m,
+                                        "execution_times": exec_times,
+                                        "base_energy":     cfg["base_energy"],
+                                        "idle_energy":     cfg["idle_energy"]
+                                    })
+                                except Exception as e:
+                                    logger.error(f"Job {job_id} ({POD}) gen={gen}: migrant eval failed: {e}")
+                                    return float("inf")
 
-                # Replace worst with migrants
-                pairs = list(zip(population, fitnesses))
-                pairs.sort(key=lambda x: x[1], reverse=True)
-                for i, fit in enumerate(migrant_fits):
-                    if i < len(pairs):
-                        pairs[i] = (migrants[i], fit)
-                population = [ind for ind, _ in pairs]
-                rdb.delete(mkey)
+                        tasks = [safe_eval_mig(m) for m in migrants]
+                        migrant_fits = await asyncio.gather(*tasks)
 
-        # Next generation
-        population = next_generation(population, fitnesses, cfg)
+                    # Replace worst with migrants
+                    pairs = list(zip(population, fitnesses))
+                    pairs.sort(key=lambda x: x[1], reverse=True)
+                    for i, fit in enumerate(migrant_fits):
+                        if i < len(pairs):
+                            pairs[i] = (migrants[i], fit)
+                    population = [ind for ind, _ in pairs]
+                    rdb.delete(mkey)
+
+            # Next generation
+            population = next_generation(population, fitnesses, cfg)
+
+    except Exception as e:
+        logger.exception(f"Job {job_id} ({POD}): fatal GA error: {e}")
+        if is_leader(job_id):
+            rdb.hset(key, mapping={"status": "error", "generation": str(gen_executed)})
+        return
 
     elapsed_all = time.time() - start_all
 
     # Leader compiles final output & uploads blob; others just exit
     if is_leader(job_id):
-        # Read the FINAL GLOBAL best from Redis (single source of truth)
         gbest_str = rdb.hget(key, "best")
         gbest = float(gbest_str) if gbest_str else (best_per_gen[-1] if best_per_gen else float("inf"))
         gind_json = rdb.hget(key, "individual")
         gind = json.loads(gind_json) if gind_json else (local_best_ind or (population[0] if population else []))
 
-        # Compute raw metrics for the GLOBAL best individual
         cores, mk, te, imb = compute_raw_metrics(gind, exec_times, cfg["num_cores"],
                                                  cfg["base_energy"], cfg["idle_energy"])
 
-        # Build final JSON in SAME SHAPE as monolithic GA
         final = {
             "run_id":               job_id,
             "case_label":           cfg.get("case_label"),
@@ -473,11 +485,14 @@ async def run_ga(job_id: str, cfg: Dict):
             "core_times":           cores
         }
 
-        # Upload JSON + plot to blob
         try:
             txt_blob = svc.get_blob_client(container=AZ_CONTAINER, blob=f"{job_id}.txt")
             txt_blob.upload_blob(json.dumps(final), overwrite=True)
 
+            import matplotlib
+            matplotlib.use("Agg")
+            import matplotlib.pyplot as plt
+            buf = io.BytesIO()
             plt.figure()
             plt.plot(final["best_per_generation"], label="Best")
             plt.plot(final["avg_per_generation"],  label="Average")
@@ -485,7 +500,6 @@ async def run_ga(job_id: str, cfg: Dict):
             plt.ylabel("Fitness")
             plt.legend()
             plt.tight_layout()
-            buf = io.BytesIO()
             plt.savefig(buf, format="png", dpi=150)
             plt.close()
             buf.seek(0)
@@ -494,20 +508,12 @@ async def run_ga(job_id: str, cfg: Dict):
         except Exception as e:
             logger.error(f"Blob upload failed for job {job_id}: {e}")
 
-        # Decide final status
         stopped_globally = get_stop_flag(job_id)
-        final_status = "stagnated" if stopped_globally else "done"
+        final_status = "stagnated" if stopped_globally else ("done" if not stagnated_local else "stagnated")
 
-        # Mark done by leader (single writer of final status)
-        rdb.hset(key, mapping={
-            "status": final_status,
-            "generation": str(gen_executed)
-        })
-
-        # Cleanup job-scoped migrants and stop flag
+        rdb.hset(key, mapping={"status": final_status, "generation": str(gen_executed)})
         rdb.delete(migrants_key(job_id))
         rdb.delete(f"job:{job_id}:stop")
-
         logger.info(f"Job {job_id}: finalized by leader {POD} → status={final_status}")
     else:
         logger.info(f"Job {job_id}: island {POD} finished (leader will finalize)")
