@@ -7,7 +7,6 @@ import logging
 import asyncio
 import socket
 import random
-import io
 import math
 
 from typing import List, Optional, Dict, Tuple
@@ -15,9 +14,6 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 import httpx
 import redis
-import matplotlib
-matplotlib.use("Agg")  # headless plotting
-import matplotlib.pyplot as plt
 from statistics import mean, pstdev
 from azure.storage.blob import BlobServiceClient
 
@@ -158,14 +154,12 @@ def next_generation(population: List[List[int]], fitnesses: List[float], cfg: Di
     pop_size = len(population)
     tour_size = 3
 
-    # Tournament selection
     selected = []
     for _ in range(pop_size):
         aspirants = random.sample(list(zip(population, fitnesses)), tour_size)
         winner    = min(aspirants, key=lambda x: x[1])[0]
         selected.append(winner.copy())
 
-    # One-point crossover
     offspring = []
     for i in range(0, pop_size, 2):
         p1, p2 = selected[i], selected[(i+1) % pop_size]
@@ -175,7 +169,6 @@ def next_generation(population: List[List[int]], fitnesses: List[float], cfg: Di
         else:
             offspring += [p1.copy(), p2.copy()]
 
-    # Mutation (single gene)
     for ind in offspring:
         if random.random() < cfg['mutation_rate']:
             idx = random.randrange(len(ind))
@@ -217,7 +210,6 @@ def try_update_global_best(job_id: str, cand_best: float, cand_individual: List[
             if cand_best >= curr:
                 pipe.unwatch()
                 return False, curr
-            # update global best, individual, and last improvement generation atomically
             pipe.multi()
             pipe.hset(key, mapping={
                 "best":               str(cand_best),
@@ -272,10 +264,8 @@ async def start_run(req: RunRequest):
     job_id    = str(uuid.uuid4())
     redis_key = f"job:{job_id}"
 
-    # Elect a leader (first pod to create job)
     rdb.setnx(f"{redis_key}:leader", POD)
 
-    # initialize job keys
     r_hset(redis_key, {
         "status": "running",
         "generation": "0",
@@ -287,9 +277,7 @@ async def start_run(req: RunRequest):
 
     cfg = req.dict()
 
-    # 1) run GA on this pod
     asyncio.create_task(run_ga(job_id, cfg))
-    # 2) fan-out to islands
     asyncio.create_task(fan_out(job_id, cfg))
 
     return RunResponse(job_id=job_id)
@@ -309,8 +297,7 @@ def status(job_id: str):
     return {
         "status":          data.get("status"),
         "generation":      int(data.get("generation", 0)),
-        "best_fitness":    float(data["best"]) if data.get("best") else None,
-        "best_individual": json.loads(data.get("individual", "[]")) if data.get("individual") else None
+        "best_fitness":    float(data["best"]) if data.get("best") else None
     }
 
 ########## API: RESULT ######################
@@ -323,7 +310,6 @@ def result(job_id: str):
     if rdb.hget(key, "status") == "running":
         raise HTTPException(400, "Job still running")
 
-    # Load final JSON from blob (single source of truth)
     try:
         svc  = BlobServiceClient.from_connection_string(AZ_CONN_STR)
         blob = svc.get_blob_client(container=AZ_CONTAINER, blob=f"{job_id}.txt")
@@ -336,35 +322,28 @@ def result(job_id: str):
 ########## MAIN GA LOOP (island) ###############################
 async def run_ga(job_id: str, cfg: Dict):
     key = f"job:{job_id}"
-    stagnated_local = False  # island-local stagnation
+    stagnated_local = False
 
-    # Azure blob client
     svc = BlobServiceClient.from_connection_string(AZ_CONN_STR)
     try:
         svc.create_container(AZ_CONTAINER)
     except Exception:
         pass
 
-    # Prepare execution times (seeded)
     base_seed = int(cfg.get("seed") or 0)
     rng_exec  = random.Random(base_seed)
     exec_times = [rng_exec.randint(10, 20) for _ in range(cfg["num_tasks"])]
     logger.info(f"Job {job_id} ({POD}): exec_times head={exec_times[:5]}")
 
-    # Island RNG (so each island differs deterministically)
     pod_name  = os.getenv("POD_NAME", "ga-island-0")
     island_id = int(pod_name.rsplit("-", 1)[-1]) if "-" in pod_name and pod_name.rsplit("-", 1)[-1].isdigit() else 0
     rng_pop   = random.Random(base_seed + island_id)
 
-    # Initialize population
     population = init_population(cfg["population"], cfg["num_tasks"], cfg["num_cores"], rng_pop)
 
-    # Per-generation stats (local, for plotting)
     best_per_gen: List[float] = []
-    avg_per_gen:  List[float] = []
     std_per_gen:  List[float] = []
 
-    # Island-local best (for migration decisions)
     local_best: float = float('inf')
     local_best_ind: Optional[List[int]] = None
 
@@ -375,7 +354,6 @@ async def run_ga(job_id: str, cfg: Dict):
     start_all = time.time()
     gen_executed = 0
 
-    # HTTP client + concurrency limits
     MAX_CONC = int(os.getenv("EVAL_CONCURRENCY", "24"))
     limits = httpx.Limits(max_connections=64, max_keepalive_connections=32)
 
@@ -409,15 +387,12 @@ async def run_ga(job_id: str, cfg: Dict):
                 finite = [f for f in fitnesses if math.isfinite(f)]
                 if finite:
                     best = min(finite)
-                    avgv = mean(finite)
                     stdv = pstdev(finite) if len(finite) > 1 else 0.0
                 else:
                     best = float("inf")
-                    avgv = float("inf")
                     stdv = 0.0
 
                 best_per_gen.append(best)
-                avg_per_gen.append(avgv)
                 std_per_gen.append(stdv)
                 gen_executed = gen
 
@@ -467,7 +442,7 @@ async def run_ga(job_id: str, cfg: Dict):
 
                 population = next_generation(population, fitnesses, cfg)
 
-            except Exception as e:
+            except Exception:
                 logger.exception(f"Job {job_id} ({POD}) gen={gen}: transient GA error; will continue")
                 error_budget -= 1
                 if error_budget <= 0:
@@ -478,7 +453,7 @@ async def run_ga(job_id: str, cfg: Dict):
                 await asyncio.sleep(0.2)
                 continue
 
-    except Exception as e:
+    except Exception:
         logger.exception(f"Job {job_id} ({POD}): fatal GA error: {e}")
         if is_leader(job_id):
             r_hset(key, {"status": "error", "generation": str(gen_executed)})
@@ -486,22 +461,17 @@ async def run_ga(job_id: str, cfg: Dict):
 
     elapsed_all = time.time() - start_all
 
-    # Leader compiles final output & uploads blob; others just exit
     if is_leader(job_id):
-        # Read the FINAL GLOBAL best from Redis (single source of truth)
         gbest_str = r_hget(key, "best")
         gbest = float(gbest_str) if gbest_str else (best_per_gen[-1] if best_per_gen else float("inf"))
         gind_json = r_hget(key, "individual")
         gind = json.loads(gind_json) if gind_json else (local_best_ind or (population[0] if population else []))
 
-        # Compute raw metrics for the GLOBAL best individual
         cores, mk, te, imb = compute_raw_metrics(gind, exec_times, cfg["num_cores"],
                                                  cfg["base_energy"], cfg["idle_energy"])
 
-        # Build final JSON
         final = {
             "run_id":               job_id,
-            "case_label":           cfg.get("case_label"),
             "num_tasks":            cfg["num_tasks"],
             "num_cores":            cfg["num_cores"],
             "num_population":       cfg["population"],
@@ -514,10 +484,8 @@ async def run_ga(job_id: str, cfg: Dict):
             "seed":                 cfg.get("seed"),
             "generations_executed": len(best_per_gen),
             "elapsed_time_s":       elapsed_all,
-            "best_individual":      gind,
             "best_fitness":         gbest,
             "best_per_generation":  best_per_gen,
-            "avg_per_generation":   avg_per_gen,
             "std_per_generation":   std_per_gen,
             "makespan":             mk,
             "total_energy":         te,
@@ -525,34 +493,16 @@ async def run_ga(job_id: str, cfg: Dict):
             "core_times":           cores
         }
 
-        # Upload JSON + plot to blob
         try:
             txt_blob = svc.get_blob_client(container=AZ_CONTAINER, blob=f"{job_id}.txt")
             txt_blob.upload_blob(json.dumps(final), overwrite=True)
-
-            plt.figure()
-            plt.plot(final["best_per_generation"], label="Best")
-            plt.plot(final["avg_per_generation"],  label="Average")
-            plt.xlabel("Generation")
-            plt.ylabel("Fitness")
-            plt.legend()
-            plt.tight_layout()
-            buf = io.BytesIO()
-            plt.savefig(buf, format="png", dpi=150)
-            plt.close()
-            buf.seek(0)
-            png_blob = svc.get_blob_client(container=AZ_CONTAINER, blob=f"{job_id}.png")
-            png_blob.upload_blob(buf.read(), overwrite=True)
         except Exception as e:
             logger.error(f"Blob upload failed for job {job_id}: {e}")
 
-        # Decide final status (global source of truth)
         stopped_globally = get_stop_flag(job_id)
         final_status = "stagnated" if stopped_globally else "done"
 
-        # Mark done by leader
         r_hset(key, {"status": final_status, "generation": str(gen_executed)})
-        # Cleanup stop flag
         rdb.delete(f"job:{job_id}:stop")
 
         logger.info(f"Job {job_id}: finalized by leader {POD} → status={final_status}")
